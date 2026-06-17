@@ -78,7 +78,6 @@
       Thanks to VisionCoder for supporting this project. <a href="https://visioncoder.com">VisionCoder Developer Platform</a> is a reliable and efficient API relay service provider, offering access to mainstream AI models such as Claude Code, Codex, and Gemini. It helps developers and teams integrate AI capabilities more easily and improve productivity. Additionally, VisionCoder now offers retail channels for Claude Max 200 and GPT Pro 200 premium accounts, providing users with instant access to top-tier AI computing power and features.
     </td>
   </tr>
-  <!--
   <tr>
     <td width="25%" align="center" valign="middle">
       <a href="https://www.atlascloud.ai/console/coding-plan">
@@ -89,7 +88,6 @@
       Atlas Cloud による本プロジェクトへのスポンサーに感謝します！Atlas Cloud は、開発者が動画生成、画像生成、および LLM API にアクセスするための单二の AI API を提供する全モーダル AI 推論プラットフォームです。複数のベンダーの統合を管理する代わりに、一度接続するだけですべてのモダリティにわたる 300 以上の厳選されたモデルに統合アクセスできます。よりリーズナブルな API アクセスのために、Atlas Cloud の新しい<a href="https://www.atlascloud.ai/console/coding-plan">コーディングプランプロモーション (coding plan)</a>をぜひチェックしてください。
     </td>
   </tr>
-  -->
   <!--
   <tr>
     <td width="25%" align="center" valign="middle">
