@@ -54,7 +54,7 @@ const KIRO_CONSTANTS = {
 
 const KIRO_CONTEXT_LIMITS = {
     // Feature 1: Payload guard
-    MAX_PAYLOAD_BYTES: 900000,          // 900KB (线上实测最大请求 ~425K tokens 未触发限制，放宽上限)
+    MAX_PAYLOAD_BYTES: 580000,          // Keep below guardPayload's 600KB hard limit so summary injection does not trigger extra hard trimming
     AUTO_TRIM_PAYLOAD: true,
 
     // Feature 2: Content-length error retry

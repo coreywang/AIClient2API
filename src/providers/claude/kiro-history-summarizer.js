@@ -25,6 +25,9 @@ const RECENT_TURNS = 6;
 /** Hard cap on summary text length to avoid re-inflating the payload. */
 const SUMMARY_MAX_CHARS = 4000;
 
+/** Summaries shorter than this usually indicate a placeholder or empty reply. */
+const SUMMARY_MIN_CHARS = 200;
+
 /** System-prompt section wrapper for injected summaries. */
 const SUMMARY_SECTION_START = '\n\n<conversation_summary>\n';
 const SUMMARY_SECTION_END = '\n</conversation_summary>';
@@ -111,6 +114,23 @@ function buildSummaryPrompt(entries) {
     return lines.join('\n');
 }
 
+function isInvalidSummary(summaryText) {
+    const text = (summaryText || '').trim();
+    if (text.length < SUMMARY_MIN_CHARS) return true;
+
+    const normalized = text.toLowerCase().replace(/\s+/g, ' ');
+    const placeholderPatterns = [
+        /^no content to summarize\.?$/,
+        /^nothing to summarize\.?$/,
+        /^there is no content to summarize\.?$/,
+        /^i have no content to summarize\.?$/,
+        /^no summary available\.?$/,
+        /^summary unavailable\.?$/,
+    ];
+
+    return placeholderPatterns.some(pattern => pattern.test(normalized));
+}
+
 // ── Tier 2: drop pure tool pairs ─────────────────────────────────────────────
 
 /**
@@ -175,6 +195,10 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
     try {
         const prompt = buildSummaryPrompt(toSummarise);
         summaryText = await callKiro(prompt);
+        if (isInvalidSummary(summaryText)) {
+            logger.warn(`[Kiro] Tier-3 summary invalid (${(summaryText || '').trim().length} chars), using rule-based fallback`);
+            summaryText = buildRuleBasedSummary(toSummarise);
+        }
         // Truncate to hard cap
         if (summaryText.length > SUMMARY_MAX_CHARS) {
             summaryText = summaryText.slice(0, SUMMARY_MAX_CHARS) + '…';

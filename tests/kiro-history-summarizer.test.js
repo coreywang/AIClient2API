@@ -69,6 +69,10 @@ function makePayload(history) {
     return { conversationState: { history } };
 }
 
+function makeValidSummary(prefix = 'Valid summary') {
+    return `${prefix}: ${'important prior context '.repeat(12)}`;
+}
+
 // ── dropOldToolPairs ──────────────────────────────────────────────────────────
 
 describe('dropOldToolPairs', () => {
@@ -240,7 +244,7 @@ describe('summariseOldHistory', () => {
             ...makeTextPair('recent text'),
         ];
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('short summary');
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
 
         await summariseOldHistory(payload, '', callKiro, 1);
 
@@ -255,14 +259,15 @@ describe('summariseOldHistory', () => {
             ...makeTextPair('recent text'),
         ];
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('This is the summary.');
+        const summary = makeValidSummary('This is the summary');
+        const callKiro = jest.fn().mockResolvedValue(summary);
 
         const result = await summariseOldHistory(payload, 'original sys', callKiro, 1);
 
         expect(result).toContain('original sys');
         expect(result).toContain('<conversation_summary>');
         expect(result).toContain('</conversation_summary>');
-        expect(result).toContain('This is the summary.');
+        expect(result).toContain(summary);
     });
 
     test('removes summarised entries from history in-place', async () => {
@@ -273,7 +278,7 @@ describe('summariseOldHistory', () => {
             ...makeTextPair('recent'),
         ];
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('summary');
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
 
         await summariseOldHistory(payload, '', callKiro, 1);
 
@@ -295,6 +300,22 @@ describe('summariseOldHistory', () => {
         expect(result).toContain('<conversation_summary>');
         expect(result).toContain('</conversation_summary>');
         expect(result.length).toBeGreaterThan(30);
+    });
+
+    test('falls back to rule-based summary when callKiro returns a tiny placeholder', async () => {
+        const history = [
+            ...makeTextPair('old implementation detail', 'old user decision'),
+            ...makeTextPair('recent'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue('No content to summarize.');
+
+        const result = await summariseOldHistory(payload, '', callKiro, 1);
+
+        expect(result).toContain('<conversation_summary>');
+        expect(result).toContain('Key exchanges:');
+        expect(result).toContain('old implementation detail');
+        expect(result).not.toContain('No content to summarize.');
     });
 
     test('truncates a very long summary to ~4000 chars with ellipsis', async () => {
@@ -373,7 +394,7 @@ describe('compressHistory', () => {
             history.push(...makeTextPair(`turn ${i}`));
         }
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('compressed summary');
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary('compressed summary'));
 
         // maxBytes=0 guarantees the payload is always "too large"
         await compressHistory(payload, 'sys', 0, callKiro, 2);
@@ -387,12 +408,13 @@ describe('compressHistory', () => {
             history.push(...makeTextPair(`turn ${i}`));
         }
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('here is a summary');
+        const summary = makeValidSummary('here is a summary');
+        const callKiro = jest.fn().mockResolvedValue(summary);
 
         const result = await compressHistory(payload, 'original', 0, callKiro, 2);
 
         expect(result).toContain('original');
-        expect(result).toContain('here is a summary');
+        expect(result).toContain(summary);
         expect(result).toContain('<conversation_summary>');
     });
 
@@ -417,13 +439,14 @@ describe('compressHistory', () => {
             ...makeTextPair('recent'),
         ];
         const payload = makePayload(history);
-        const callKiro = jest.fn().mockResolvedValue('final summary');
+        const summary = makeValidSummary('final summary');
+        const callKiro = jest.fn().mockResolvedValue(summary);
 
         const result = await compressHistory(payload, 'base', 0, callKiro, 1);
 
         // Tier-3 must have fired
         expect(callKiro).toHaveBeenCalledTimes(1);
         // Summary must appear in returned prompt
-        expect(result).toContain('final summary');
+        expect(result).toContain(summary);
     });
 });
