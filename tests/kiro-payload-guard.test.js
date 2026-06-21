@@ -175,7 +175,7 @@ describe('kiro-payload-guard', () => {
             expect(payload.conversationState.history.length).toBeLessThan(700);
         });
 
-        test('returns error string when payload is irreducibly too large', () => {
+        test('returns null when payload is still above the heuristic limit after trimming', () => {
             // Single enormous current message that can't be trimmed via history
             const payload = {
                 conversationState: {
@@ -190,8 +190,7 @@ describe('kiro-payload-guard', () => {
                 }
             };
             const result = guardPayload(payload);
-            expect(typeof result).toBe('string');
-            expect(result).toContain('exceeds');
+            expect(result).toBeNull();
         });
     });
 

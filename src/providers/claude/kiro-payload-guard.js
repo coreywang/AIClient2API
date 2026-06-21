@@ -138,8 +138,12 @@ export function trimPayloadToLimit(payload, maxBytes = MAX_PAYLOAD_BYTES) {
 /**
  * Check payload size and optionally auto-trim.
  *
+ * The byte limit is a local safety heuristic, not an authoritative Kiro API
+ * contract. If trimming cannot bring the payload under the heuristic limit,
+ * allow the request to continue and let Kiro return the real upstream result.
+ *
  * @param {object} payload - The full Kiro API request payload
- * @returns {string|null} null if payload is OK, error message string if too large
+ * @returns {string|null} null; retained for backwards-compatible call sites
  */
 export function guardPayload(payload) {
     const size = checkPayloadSize(payload);
@@ -151,17 +155,17 @@ export function guardPayload(payload) {
     if (AUTO_TRIM_PAYLOAD) {
         const stats = trimPayloadToLimit(payload, MAX_PAYLOAD_BYTES);
         if (stats.finalBytes > MAX_PAYLOAD_BYTES) {
-            return (
-                `Payload size (${stats.finalBytes} bytes) exceeds Kiro API limit ` +
-                `(${MAX_PAYLOAD_BYTES} bytes) even after trimming. ` +
-                `Try reducing message history or tools.`
+            logger.warn(
+                `[Kiro] Payload size (${stats.finalBytes} bytes) remains above local ` +
+                `heuristic limit (${MAX_PAYLOAD_BYTES} bytes) after trimming; sending anyway`
             );
         }
         return null;
     }
 
-    return (
-        `Payload size (${size} bytes) exceeds Kiro API limit ` +
-        `(${MAX_PAYLOAD_BYTES} bytes). Auto-trim is disabled.`
+    logger.warn(
+        `[Kiro] Payload size (${size} bytes) exceeds local heuristic limit ` +
+        `(${MAX_PAYLOAD_BYTES} bytes), but auto-trim is disabled; sending anyway`
     );
+    return null;
 }

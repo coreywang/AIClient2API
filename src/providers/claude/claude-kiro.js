@@ -24,7 +24,6 @@ import { detectTruncation, injectTruncationRecovery } from './kiro-truncation-re
 import { compressHistory } from './kiro-history-summarizer.js';
 import {
     compactKiroToolsToBudget,
-    createKiroPayloadTooLargeError,
     KIRO_TOOL_DESCRIPTION_MAX_CHARS,
     sanitizeSchemaDescriptions,
     truncateText
@@ -1722,7 +1721,7 @@ async saveCredentialsToFile(filePath, newData) {
         // Feature 1: payload size guard — prevent "Improperly formed request." from Kiro API
         const payloadError = guardPayload(request);
         if (payloadError) {
-            throw createKiroPayloadTooLargeError(payloadError);
+            logger.warn(`[Kiro] Payload guard warning: ${payloadError}`);
         }
 
         return request;

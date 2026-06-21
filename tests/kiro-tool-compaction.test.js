@@ -1,6 +1,5 @@
 import {
     compactKiroToolsToBudget,
-    createKiroPayloadTooLargeError,
     KIRO_TOOL_DESCRIPTION_MAX_CHARS,
     KIRO_TOOLS_CONTEXT_MAX_BYTES,
     sanitizeSchemaDescriptions,
@@ -54,14 +53,5 @@ describe('Kiro tool metadata compaction', () => {
         for (const tool of kiroTools) {
             expect(tool.toolSpecification.description.length).toBeLessThanOrEqual(2051);
         }
-    });
-
-    test('marks irreducible local payload errors as client errors without credential penalty', () => {
-        const error = createKiroPayloadTooLargeError('Payload size (700000 bytes) exceeds Kiro API limit');
-
-        expect(error.message).toContain('Payload size');
-        expect(error.skipErrorCount).toBe(true);
-        expect(error.response?.status).toBe(400);
-        expect(error.shouldSwitchCredential).not.toBe(true);
     });
 });

@@ -107,13 +107,3 @@ export function compactKiroToolsToBudget(kiroTools, maxBytes = KIRO_TOOLS_CONTEX
     logger.warn(`[Kiro] Tools payload remains ${bytes} bytes after maximum compaction`);
     return kiroTools;
 }
-
-export function createKiroPayloadTooLargeError(message) {
-    const error = new Error(`[Kiro] ${message}`);
-    error.skipErrorCount = true;
-    error.response = {
-        status: 400,
-        data: message
-    };
-    return error;
-}
