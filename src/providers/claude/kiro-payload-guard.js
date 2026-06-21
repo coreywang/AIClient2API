@@ -38,7 +38,7 @@ function stripEmptyToolUses(history) {
  * Modifies history in-place.
  * Logs a warning if all entries were removed (T5 fix).
  */
-function alignToUserMessage(history) {
+export function alignToUserMessage(history) {
     const originalLen = history.length;
     while (history.length > 0 && !('userInputMessage' in history[0])) {
         history.shift();
@@ -53,7 +53,7 @@ function alignToUserMessage(history) {
  * in the preceding assistant message.
  * Modifies history in-place.
  */
-function repairOrphanedToolResults(history) {
+export function repairOrphanedToolResults(history) {
     for (let i = 0; i < history.length; i++) {
         const userMsg = history[i].userInputMessage;
         if (!userMsg) continue;

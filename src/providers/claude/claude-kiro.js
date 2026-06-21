@@ -19,7 +19,7 @@ import {
 import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
-import { guardPayload } from './kiro-payload-guard.js';
+import { guardPayload, alignToUserMessage, repairOrphanedToolResults } from './kiro-payload-guard.js';
 import { detectTruncation, injectTruncationRecovery } from './kiro-truncation-recovery.js';
 
 const KIRO_THINKING = {
@@ -1599,6 +1599,8 @@ async saveCredentialsToFile(filePath, newData) {
                     logger.info(`[Kiro] Pre-estimate truncated history: ${history.length} -> ${kept.length} entries (${historyChars} -> ${keptChars} chars)`);
                     history.length = 0;
                     history.push(...kept);
+                    alignToUserMessage(history);
+                    repairOrphanedToolResults(history);
                 }
             }
         }

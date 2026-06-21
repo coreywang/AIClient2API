@@ -7,6 +7,8 @@ config.json
 provider_pools.json
 custom_models.json
 plugins.json
+plugins/*
+!plugins/.gitkeep
 fetch_system_prompt.txt
 input_system_prompt.txt
 token-store.json
@@ -18,5 +20,5 @@ api-potluck-keys.json
 api-potluck-data.json
 model-usage-stats.json
 AGENTS.md
-src/plugins-user/
-
+src/plugins-user/*
+!src/plugins-user/.gitkeep
