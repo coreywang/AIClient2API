@@ -51,7 +51,7 @@ RUN chmod +x /app/tls-sidecar/tls-sidecar
 USER root
 
 # 创建目录用于存储日志和系统提示文件
-RUN mkdir -p /app/logs
+RUN mkdir -p /app/logs /app/src/plugins-user
 
 # 暴露端口
 EXPOSE 3000 8085 8086 19876-19880
