@@ -19,6 +19,8 @@ import {
 import { configureAxiosProxy, configureTLSSidecar, isTLSSidecarEnabledForProvider } from '../../utils/proxy-utils.js';
 import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalizedErrorResponseText, buildHttpErrorReason, normalizeProviderErrorMessage } from '../../utils/common.js';
 import { getProviderPoolManager } from '../../services/service-manager.js';
+import { guardPayload } from './kiro-payload-guard.js';
+import { detectTruncation, injectTruncationRecovery } from './kiro-truncation-recovery.js';
 
 const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
@@ -47,6 +49,24 @@ const KIRO_CONSTANTS = {
     CHAT_TRIGGER_TYPE_MANUAL: 'MANUAL',
     ORIGIN_AI_EDITOR: 'AI_EDITOR',
     TOTAL_CONTEXT_TOKENS: 200000, // Claude Sonnet 4.5 actual context is 200K
+};
+
+const KIRO_CONTEXT_LIMITS = {
+    // Feature 1: Payload guard
+    MAX_PAYLOAD_BYTES: 600000,          // 600KB, below Kiro's ~615KB hard limit
+    AUTO_TRIM_PAYLOAD: true,
+
+    // Feature 2: Content-length error retry
+    RETRY_MAX_MESSAGES: 20,             // max messages to keep on retry
+    RETRY_MAX_COUNT: 2,                 // max content-length retries
+
+    // Feature 3: Pre-flight estimation
+    PRE_ESTIMATE_ENABLED: true,
+    PRE_ESTIMATE_THRESHOLD: 180000,     // history JSON chars to trigger pre-truncation
+    PRE_ESTIMATE_TARGET_RATIO: 0.8,     // trim to 80% of threshold
+
+    // Feature 4: Truncation recovery
+    TRUNCATION_RECOVERY_ENABLED: true,
 };
 
 const KIRO_MAX_TOOL_NAME_LENGTH = 64;
@@ -133,6 +153,37 @@ async function acquireKiroRequestSlot(config) {
         released = true;
         releaseCurrent();
     };
+}
+
+/**
+ * Feature 2: detect content-length exceeded errors from Kiro API.
+ * @param {string} errorText - normalized error response text
+ * @returns {boolean}
+ */
+function isContentLengthError(errorText) {
+    if (!errorText) return false;
+    if (errorText.includes('CONTENT_LENGTH_EXCEEDS_THRESHOLD')) return true;
+    if (errorText.includes('Input is too long')) return true;
+    const lower = errorText.toLowerCase();
+    return lower.includes('too long') && (
+        lower.includes('input') || lower.includes('content') || lower.includes('message')
+    );
+}
+
+/**
+ * Feature 2: truncate messages array for content-length retry.
+ * First retry always cuts to 70% to guarantee actual truncation even when
+ * messages.length <= maxMessages. Subsequent retries apply progressive factor.
+ * @param {Array} messages
+ * @param {number} contentLengthRetryCount - separate counter for content-length retries
+ * @param {number} maxMessages
+ * @returns {Array}
+ */
+function truncateMessagesForRetry(messages, contentLengthRetryCount, maxMessages = 20) {
+    const factor = contentLengthRetryCount === 0 ? 0.7 : Math.max(0.1, 1.0 - contentLengthRetryCount * 0.3);
+    const target = Math.max(5, Math.floor(maxMessages * factor));
+    if (messages.length <= target) return messages.slice(-Math.max(5, target - 1));
+    return messages.slice(-target);
 }
 
 function normalizeKiroToolInput(input) {
@@ -1085,7 +1136,14 @@ async saveCredentialsToFile(filePath, newData) {
         } else {
             systemPrompt = `${builtInPrefix}`;
         }
-        
+
+        // Feature 4: inject truncation recovery message if previous response was truncated
+        // State is passed via requestBody._prevTruncation to avoid instance-level concurrency issues
+        if (KIRO_CONTEXT_LIMITS.TRUNCATION_RECOVERY_ENABLED && requestBody._prevTruncation?.wasTruncated) {
+            messages = [...messages]; // shallow copy to avoid mutating caller's array
+            injectTruncationRecovery(messages, requestBody._prevTruncation);
+        }
+
         const processedMessages = messages.map(message => ({
             ...message,
             content: Array.isArray(message.content) ? [...message.content] : message.content
@@ -1124,7 +1182,8 @@ async saveCredentialsToFile(filePath, newData) {
                 const lastMsg = mergedMessages[mergedMessages.length - 1];
                 
                 // 判断当前消息和上一条消息是否为相同 role
-                if (currentMsg.role === lastMsg.role) {
+                // T4: skip merge for messages marked with _noMerge (e.g. truncation recovery)
+                if (currentMsg.role === lastMsg.role && !currentMsg._noMerge && !lastMsg._noMerge) {
                     // 合并消息内容
                     if (Array.isArray(lastMsg.content) && Array.isArray(currentMsg.content)) {
                         // 如果都是数组,合并数组内容
@@ -1523,6 +1582,27 @@ async saveCredentialsToFile(filePath, newData) {
             }
         }
 
+        // Feature 3: pre-flight history size estimation — truncate before hitting API limits
+        if (KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_ENABLED && history.length > 2) {
+            const historyChars = JSON.stringify(history).length;
+            if (historyChars > KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_THRESHOLD) {
+                const targetChars = Math.floor(KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_THRESHOLD * KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_TARGET_RATIO);
+                const kept = [];
+                let keptChars = 0;
+                for (let i = history.length - 1; i >= 0; i--) {
+                    const entryChars = JSON.stringify(history[i]).length;
+                    if (keptChars + entryChars > targetChars && kept.length > 0) break;
+                    kept.unshift(history[i]);
+                    keptChars += entryChars;
+                }
+                if (kept.length < history.length) {
+                    logger.info(`[Kiro] Pre-estimate truncated history: ${history.length} -> ${kept.length} entries (${historyChars} -> ${keptChars} chars)`);
+                    history.length = 0;
+                    history.push(...kept);
+                }
+            }
+        }
+
         const request = {
             conversationState: {
                 agentTaskType: "vibe",
@@ -1602,6 +1682,13 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // fs.writeFile('claude-kiro-request'+Date.now()+'.json', JSON.stringify(request));
+
+        // Feature 1: payload size guard — prevent "Improperly formed request." from Kiro API
+        const payloadError = guardPayload(request);
+        if (payloadError) {
+            throw new Error(`[Kiro] ${payloadError}`);
+        }
+
         return request;
     }
 
@@ -1702,7 +1789,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 调用 API 并处理错误重试
      */
-    async callApi(method, model, body, isRetry = false, retryCount = 0) {
+    async callApi(method, model, body, isRetry = false, retryCount = 0, contentLengthRetryCount = 0) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000; // 1 second base delay
@@ -1824,6 +1911,18 @@ async saveCredentialsToFile(filePath, newData) {
                 logger.info(`[Kiro] Network error (${errorIdentifier}). Retrying in ${delay}ms... (attempt ${retryCount + 1}/${maxRetries})`);
                 await new Promise(resolve => setTimeout(resolve, delay));
                 return this.callApi(method, model, body, isRetry, retryCount + 1);
+            }
+
+            // Feature 2: content-length error retry — truncate messages and retry
+            // Uses independent contentLengthRetryCount to avoid conflict with network retryCount (T2 fix)
+            if (body.messages && contentLengthRetryCount < KIRO_CONTEXT_LIMITS.RETRY_MAX_COUNT) {
+                const errText = await getNormalizedErrorResponseText(error);
+                if (isContentLengthError(errText)) {
+                    const truncated = truncateMessagesForRetry(body.messages, contentLengthRetryCount, KIRO_CONTEXT_LIMITS.RETRY_MAX_MESSAGES);
+                    logger.info(`[Kiro] Content too long, truncating messages ${body.messages.length} -> ${truncated.length} and retrying (content-length attempt ${contentLengthRetryCount + 1})...`);
+                    const newBody = { ...body, messages: truncated };
+                    return this.callApi(method, model, newBody, isRetry, retryCount, contentLengthRetryCount + 1);
+                }
             }
 
             if (error.response && error.response.data) { logger.error('[Kiro] 400 Response body:', typeof error.response.data === 'string' ? error.response.data.substring(0, 500) : JSON.stringify(error.response.data).substring(0, 500)); }
@@ -2133,6 +2232,8 @@ async saveCredentialsToFile(filePath, newData) {
         const response = await this.callApi('', finalModel, requestBody);
 
         try {
+            // Save raw response text before processing for accurate truncation detection (T6)
+            const rawResponseData = Buffer.isBuffer(response.data) ? response.data.toString('utf8') : String(response.data);
             const { responseText, toolCalls } = this._processApiResponse(response);
             const thinkingType = requestBody?.thinking?.type;
             const thinkingRequested = typeof thinkingType === 'string' &&
@@ -2140,6 +2241,24 @@ async saveCredentialsToFile(filePath, newData) {
             const contentForClaude = thinkingRequested
                 ? this._toClaudeContentBlocksFromKiroText(responseText)
                 : responseText;
+
+            // Feature 4: detect truncation for recovery injection on next request
+            // Use raw response data before repairJson processing (T6 fix)
+            if (KIRO_CONTEXT_LIMITS.TRUNCATION_RECOVERY_ENABLED) {
+                if (detectTruncation(rawResponseData, toolCalls)) {
+                    const lastTc = toolCalls?.[toolCalls.length - 1];
+                    // Store state on requestBody to avoid instance-level concurrency issues (T1 fix)
+                    requestBody._prevTruncation = {
+                        wasTruncated: true,
+                        toolUseId: lastTc?.id || null,
+                        toolName: lastTc?.function?.name || null,
+                    };
+                    logger.warn('[Kiro] Truncation detected in generateContent. Next request will include recovery message.');
+                } else {
+                    requestBody._prevTruncation = { wasTruncated: false, toolUseId: null, toolName: null };
+                }
+            }
+
             return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens);
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
@@ -2280,7 +2399,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * 真正的流式 API 调用 - 使用 responseType: 'stream'
      */
-    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0) {
+    async * streamApiReal(method, model, body, isRetry = false, retryCount = 0, contentLengthRetryCount = 0) {
         if (!this.isInitialized) await this.initialize();
         const maxRetries = this.config.REQUEST_MAX_RETRIES || 3;
         const baseDelay = this.config.REQUEST_BASE_DELAY || 1000;
@@ -2441,6 +2560,19 @@ async saveCredentialsToFile(filePath, newData) {
                 await new Promise(resolve => setTimeout(resolve, delay));
                 yield* this.streamApiReal(method, model, body, isRetry, retryCount + 1);
                 return;
+            }
+
+            // Feature 2: content-length error retry — truncate messages and retry
+            // Uses independent contentLengthRetryCount to avoid conflict with network retryCount (T2 fix)
+            if (body.messages && contentLengthRetryCount < KIRO_CONTEXT_LIMITS.RETRY_MAX_COUNT) {
+                const errText = await getNormalizedErrorResponseText(error);
+                if (isContentLengthError(errText)) {
+                    const truncated = truncateMessagesForRetry(body.messages, contentLengthRetryCount, KIRO_CONTEXT_LIMITS.RETRY_MAX_MESSAGES);
+                    logger.info(`[Kiro] Content too long in stream, truncating messages ${body.messages.length} -> ${truncated.length} and retrying (content-length attempt ${contentLengthRetryCount + 1})...`);
+                    const newBody = { ...body, messages: truncated };
+                    yield* this.streamApiReal(method, model, newBody, isRetry, retryCount, contentLengthRetryCount + 1);
+                    return;
+                }
             }
 
             logger.error(`[Kiro] Stream API call failed (Status: ${status}, Code: ${errorCode}):`,  error.message);
@@ -2991,6 +3123,22 @@ async saveCredentialsToFile(filePath, newData) {
 
             // 5. 发送 message_stop 事件
             yield { type: "message_stop" };
+
+            // Feature 4: detect truncation for recovery injection on next request
+            // Store state on requestBody to avoid instance-level concurrency issues (T1 fix)
+            if (KIRO_CONTEXT_LIMITS.TRUNCATION_RECOVERY_ENABLED) {
+                if (detectTruncation(totalContent, toolCalls)) {
+                    const lastTc = toolCalls?.[toolCalls.length - 1];
+                    requestBody._prevTruncation = {
+                        wasTruncated: true,
+                        toolUseId: lastTc?.toolUseId || null,
+                        toolName: lastTc?.name || null,
+                    };
+                    logger.warn('[Kiro] Truncation detected in generateContentStream. Next request will include recovery message.');
+                } else {
+                    requestBody._prevTruncation = { wasTruncated: false, toolUseId: null, toolName: null };
+                }
+            }
 
         } catch (error) {
             logger.error('[Kiro] Error in streaming generation:', error);
