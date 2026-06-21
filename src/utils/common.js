@@ -2241,7 +2241,7 @@ function createErrorResponse(error, fromProvider) {
  * @param {string} fromProvider - 客户端期望的提供商格式
  * @returns {string} 格式化的流式错误响应字符串
  */
-function createStreamErrorResponse(error, fromProvider) {
+export function createStreamErrorResponse(error, fromProvider) {
     const protocolPrefix = getProtocolPrefix(fromProvider);
     const rawStatusCode = error.status || error.code || 500;
     const statusCode = ensureValidStatusCode(rawStatusCode);
@@ -2280,16 +2280,13 @@ function createStreamErrorResponse(error, fromProvider) {
             return `data: ${JSON.stringify(openaiError)}\n\n`;
             
         case MODEL_PROTOCOL_PREFIX.OPENAI_RESPONSES:
-            // OpenAI Responses API 流式错误格式（SSE event + data）
+            // OpenAI Responses streaming error event uses a top-level type/code/message shape.
             const responsesError = {
-                id: `resp_${Date.now()}`,
-                object: "error",
-                created: Math.floor(Date.now() / 1000),
-                error: {
-                    type: getErrorType(statusCode),
-                    message: errorMessage,
-                    code: getErrorType(statusCode)
-                }
+                type: "error",
+                code: getErrorType(statusCode),
+                message: errorMessage,
+                param: null,
+                sequence_number: 0
             };
             return `event: error\ndata: ${JSON.stringify(responsesError)}\n\n`;
             
