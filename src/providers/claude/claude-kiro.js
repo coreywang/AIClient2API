@@ -1113,7 +1113,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build CodeWhisperer request from OpenAI messages
      */
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null) {
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, prevTruncation = null) {
         const conversationId = uuidv4();
         
         // 内置的 systemPrompt 前缀
@@ -1138,10 +1138,10 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // Feature 4: inject truncation recovery message if previous response was truncated
-        // State is passed via requestBody._prevTruncation to avoid instance-level concurrency issues
-        if (KIRO_CONTEXT_LIMITS.TRUNCATION_RECOVERY_ENABLED && requestBody._prevTruncation?.wasTruncated) {
+        // State is passed via prevTruncation parameter to avoid instance-level concurrency issues
+        if (KIRO_CONTEXT_LIMITS.TRUNCATION_RECOVERY_ENABLED && prevTruncation?.wasTruncated) {
             messages = [...messages]; // shallow copy to avoid mutating caller's array
-            injectTruncationRecovery(messages, requestBody._prevTruncation);
+            injectTruncationRecovery(messages, prevTruncation);
         }
 
         const processedMessages = messages.map(message => ({
@@ -1808,7 +1808,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body._prevTruncation);
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -2418,7 +2418,7 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking);
+        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body._prevTruncation);
         const toolNameMaps = requestData._kiroToolNameMaps;
 
         const token = this.accessToken;
