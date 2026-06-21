@@ -53,7 +53,7 @@ const KIRO_CONSTANTS = {
 
 const KIRO_CONTEXT_LIMITS = {
     // Feature 1: Payload guard
-    MAX_PAYLOAD_BYTES: 600000,          // 600KB, below Kiro's ~615KB hard limit
+    MAX_PAYLOAD_BYTES: 900000,          // 900KB (线上实测最大请求 ~425K tokens 未触发限制，放宽上限)
     AUTO_TRIM_PAYLOAD: true,
 
     // Feature 2: Content-length error retry
@@ -62,7 +62,7 @@ const KIRO_CONTEXT_LIMITS = {
 
     // Feature 3: Pre-flight estimation
     PRE_ESTIMATE_ENABLED: true,
-    PRE_ESTIMATE_THRESHOLD: 180000,     // history JSON chars to trigger pre-truncation
+    PRE_ESTIMATE_THRESHOLD: 600000,     // 600K chars (从 180K 放大，线上从未触发截断错误)
     PRE_ESTIMATE_TARGET_RATIO: 0.8,     // trim to 80% of threshold
 
     // Feature 4: Truncation recovery
