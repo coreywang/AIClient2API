@@ -22,6 +22,13 @@ import { getProviderPoolManager } from '../../services/service-manager.js';
 import { guardPayload, alignToUserMessage, repairOrphanedToolResults } from './kiro-payload-guard.js';
 import { detectTruncation, injectTruncationRecovery } from './kiro-truncation-recovery.js';
 import { compressHistory } from './kiro-history-summarizer.js';
+import {
+    compactKiroToolsToBudget,
+    createKiroPayloadTooLargeError,
+    KIRO_TOOL_DESCRIPTION_MAX_CHARS,
+    sanitizeSchemaDescriptions,
+    truncateText
+} from './kiro-tool-compactor.js';
 
 const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
@@ -1244,8 +1251,6 @@ async saveCredentialsToFile(filePath, newData) {
                 };
                 toolsContext = { tools: [placeholderTool] };
             } else {
-                const MAX_DESCRIPTION_LENGTH = 9216;
-
                 let truncatedCount = 0;
                 const kiroTools = filteredTools
                     .filter(tool => {
@@ -1260,8 +1265,8 @@ async saveCredentialsToFile(filePath, newData) {
                         let desc = tool.description || "";
                         const originalLength = desc.length;
                         
-                        if (desc.length > MAX_DESCRIPTION_LENGTH) {
-                            desc = desc.substring(0, MAX_DESCRIPTION_LENGTH) + "...";
+                        if (desc.length > KIRO_TOOL_DESCRIPTION_MAX_CHARS) {
+                            desc = truncateText(desc, KIRO_TOOL_DESCRIPTION_MAX_CHARS);
                             truncatedCount++;
                             logger.info(`[Kiro] Truncated tool '${tool.name}' description: ${originalLength} -> ${desc.length} chars`);
                         }
@@ -1271,14 +1276,14 @@ async saveCredentialsToFile(filePath, newData) {
                                 name: toolNameMaps.toKiroName(tool.name),
                                 description: desc,
                                 inputSchema: {
-                                    json: tool.input_schema || {}
+                                    json: sanitizeSchemaDescriptions(tool.input_schema || {})
                                 }
                             }
                         };
                     });
                 
                 if (truncatedCount > 0) {
-                    logger.info(`[Kiro] Truncated ${truncatedCount} tool description(s) to max ${MAX_DESCRIPTION_LENGTH} chars`);
+                    logger.info(`[Kiro] Truncated ${truncatedCount} tool description(s) to max ${KIRO_TOOL_DESCRIPTION_MAX_CHARS} chars`);
                 }
 
                 // 检查过滤后是否还有有效工具
@@ -1298,7 +1303,7 @@ async saveCredentialsToFile(filePath, newData) {
                     };
                     toolsContext = { tools: [placeholderTool] };
                 } else {
-                    toolsContext = { tools: kiroTools };
+                    toolsContext = { tools: compactKiroToolsToBudget(kiroTools) };
                 }
             }
         } else {
@@ -1717,7 +1722,7 @@ async saveCredentialsToFile(filePath, newData) {
         // Feature 1: payload size guard — prevent "Improperly formed request." from Kiro API
         const payloadError = guardPayload(request);
         if (payloadError) {
-            throw new Error(`[Kiro] ${payloadError}`);
+            throw createKiroPayloadTooLargeError(payloadError);
         }
 
         return request;
