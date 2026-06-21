@@ -21,6 +21,7 @@ import { isRetryableNetworkError, MODEL_PROVIDER, formatExpiryLog, getNormalized
 import { getProviderPoolManager } from '../../services/service-manager.js';
 import { guardPayload, alignToUserMessage, repairOrphanedToolResults } from './kiro-payload-guard.js';
 import { detectTruncation, injectTruncationRecovery } from './kiro-truncation-recovery.js';
+import { compressHistory } from './kiro-history-summarizer.js';
 
 const KIRO_THINKING = {
     MIN_BUDGET_TOKENS: 1024,
@@ -1583,29 +1584,6 @@ async saveCredentialsToFile(filePath, newData) {
             }
         }
 
-        // Feature 3: pre-flight history size estimation — truncate before hitting API limits
-        if (KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_ENABLED && history.length > 2) {
-            const historyChars = JSON.stringify(history).length;
-            if (historyChars > KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_THRESHOLD) {
-                const targetChars = Math.floor(KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_THRESHOLD * KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_TARGET_RATIO);
-                const kept = [];
-                let keptChars = 0;
-                for (let i = history.length - 1; i >= 0; i--) {
-                    const entryChars = JSON.stringify(history[i]).length;
-                    if (keptChars + entryChars > targetChars && kept.length > 0) break;
-                    kept.unshift(history[i]);
-                    keptChars += entryChars;
-                }
-                if (kept.length < history.length) {
-                    logger.info(`[Kiro] Pre-estimate truncated history: ${history.length} -> ${kept.length} entries (${historyChars} -> ${keptChars} chars)`);
-                    history.length = 0;
-                    history.push(...kept);
-                    alignToUserMessage(history);
-                    repairOrphanedToolResults(history);
-                }
-            }
-        }
-
         const request = {
             conversationState: {
                 agentTaskType: "vibe",
@@ -1685,6 +1663,56 @@ async saveCredentialsToFile(filePath, newData) {
         }
 
         // fs.writeFile('claude-kiro-request'+Date.now()+'.json', JSON.stringify(request));
+
+        // Feature 3: three-tier history compression — runs before payload guard
+        // so that guardPayload only fires when compression itself wasn't enough
+        if (KIRO_CONTEXT_LIMITS.PRE_ESTIMATE_ENABLED && Array.isArray(request.conversationState?.history)) {
+            // callKiro: send a single-turn summary prompt to Kiro and return the text response
+            const callKiroForSummary = async (promptText) => {
+                const summaryBody = {
+                    messages: [{ role: 'user', content: promptText }],
+                    // use the same model that was requested for the main call
+                    _summaryCall: true
+                };
+                let summaryText = '';
+                for await (const event of this.streamApiReal('', codewhispererModel, summaryBody)) {
+                    if (event.type === 'content' && event.content) {
+                        summaryText += event.content;
+                    }
+                }
+                return summaryText.trim();
+            };
+
+            systemPrompt = await compressHistory(
+                request,
+                systemPrompt,
+                KIRO_CONTEXT_LIMITS.MAX_PAYLOAD_BYTES,
+                callKiroForSummary,
+            );
+
+            // If summary was injected, update the system prompt in the payload.
+            // The system prompt lives inside currentMessage.userInputMessage.content
+            // (whenrged there) or as a standalone field — update both places.
+            if (request.conversationState?.currentMessage?.userInputMessage) {
+                const uim = request.conversationState.currentMessage.userInputMessage;
+                // Re-attach updated systemPrompt to userInputMessage.content if it was merged
+                if (uim.content && uim.content.includes(builtInPrefix)) {
+                    // systemPrompt was merged into content; rebuild
+                    uim.content = currentContent
+                        ? `${systemPrompt}\n\n${currentContent}`
+                        : systemPrompt;
+                }
+            }
+            if (request.conversationState?.systemPrompt !== undefined) {
+                request.conversationState.systemPrompt = systemPrompt;
+            }
+
+            // Re-align and repair after compression may have spliced history
+            if (Array.isArray(request.conversationState?.history)) {
+                alignToUserMessage(request.conversationState.history);
+                repairOrphanedToolResults(request.conversationState.history);
+            }
+        }
 
         // Feature 1: payload size guard — prevent "Improperly formed request." from Kiro API
         const payloadError = guardPayload(request);
