@@ -1144,7 +1144,7 @@ async saveCredentialsToFile(filePath, newData) {
             injectTruncationRecovery(messages, prevTruncation);
         }
 
-        const processedMessages = messages.map(message => ({
+        const processedMessages = messages.map(({ _noMerge, ...message }) => ({
             ...message,
             content: Array.isArray(message.content) ? [...message.content] : message.content
         }));
@@ -1165,7 +1165,8 @@ async saveCredentialsToFile(filePath, newData) {
         // 判断最后一条消息是否为 assistant,如果是则移除
         const lastMessage = processedMessages[processedMessages.length - 1];
         if (processedMessages.length > 0 && lastMessage.role === 'assistant') {
-            if (lastMessage.content[0].type === "text" && lastMessage.content[0].text === "{") {
+            if (Array.isArray(lastMessage.content) && lastMessage.content.length > 0 &&
+                lastMessage.content[0].type === "text" && lastMessage.content[0].text === "{") {
                 logger.info('[Kiro] Removing last assistant with "{" message from processedMessages');
                 processedMessages.pop();
             }
