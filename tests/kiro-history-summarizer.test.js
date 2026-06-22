@@ -264,10 +264,12 @@ describe('summariseOldHistory', () => {
         await summariseOldHistory(payload, '', callKiro, 1);
 
         const prompt = callKiro.mock.calls[0][0];
-        expect(prompt).toContain('durable working memory');
-        expect(prompt).toContain('[Tool call t1]: Read');
+        expect(prompt).toContain('durable structured working memory');
+        expect(prompt).toContain('<coding_memory>');
+        expect(prompt).toContain('Pinned facts extracted locally');
+        expect(prompt).toContain('[Tool call] Read#t1');
         expect(prompt).toContain('/src/t1.js');
-        expect(prompt).toContain('[Tool result: t1]');
+        expect(prompt).toContain('[Tool result] t1');
     });
 
     test('retries once when callKiro returns a too-short summary', async () => {
@@ -283,7 +285,7 @@ describe('summariseOldHistory', () => {
         const result = await summariseOldHistory(payload, '', callKiro, 1);
 
         expect(callKiro).toHaveBeenCalledTimes(2);
-        expect(callKiro.mock.calls[1][0]).toContain('previous summary was too short');
+        expect(callKiro.mock.calls[1][0]).toContain('previous coding memory was too short');
         expect(result).toContain('Retried valid summary');
         expect(result).not.toContain('Key exchanges:');
     });
@@ -348,9 +350,42 @@ describe('summariseOldHistory', () => {
         const result = await summariseOldHistory(payload, '', callKiro, 1);
 
         expect(result).toContain('<conversation_summary>');
-        expect(result).toContain('Key exchanges:');
+        expect(result).toContain('<coding_memory>');
+        expect(result).toContain('Open TODO:');
         expect(result).toContain('old implementation detail');
         expect(result).not.toContain('No content to summarize.');
+    });
+
+    test('summary prompt compacts large tool results before calling Kiro', async () => {
+        const hugeToolResult = {
+            toolUseId: 'big',
+            content: [{
+                text: [
+                    'read /repo/src/app.js',
+                    'npm test -- tests/app.test.js',
+                    'ERROR expected true received false',
+                    'x'.repeat(80_000),
+                    'fatal: build failed',
+                ].join('\n'),
+            }],
+            status: 'error',
+        };
+        const history = [
+            makeAssistantEntry('', [{ toolUseId: 'big', name: 'Bash', input: { command: 'npm test -- tests/app.test.js' } }]),
+            makeUserEntry('', [hugeToolResult]),
+            ...makeTextPair('recent'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
+
+        await summariseOldHistory(payload, '', callKiro, 1);
+
+        const prompt = callKiro.mock.calls[0][0];
+        expect(prompt.length).toBeLessThan(30_000);
+        expect(prompt).toContain('npm test -- tests/app.test.js');
+        expect(prompt).toContain('ERROR expected true received false');
+        expect(prompt).toContain('fatal: build failed');
+        expect(prompt).not.toContain('x'.repeat(10_000));
     });
 
     test('truncates a very long summary to ~6000 chars with ellipsis', async () => {

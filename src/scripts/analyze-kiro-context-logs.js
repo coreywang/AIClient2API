@@ -129,6 +129,10 @@ function createStats() {
         tier2Sufficient: 0,
         tier3Started: 0,
         tier3SummarisedEntries: [],
+        tier3PromptChars: [],
+        tier3PromptPinnedFacts: [],
+        tier3PromptToolEvents: [],
+        tier3PromptTranscriptExcerpts: [],
         tier3Generated: 0,
         tier3SummaryChars: [],
         tier3Attempts: [],
@@ -223,6 +227,15 @@ function parseLogText(text, stats) {
             if (requestId && timestampMs !== null) {
                 tier3StartedAtByReq.set(requestId, timestampMs);
             }
+            continue;
+        }
+
+        match = line.match(/Tier-3 summary prompt compacted: (\d+) history entries -> (\d+) chars \(pinnedFacts=(\d+), toolEvents=(\d+), transcriptExcerpts=(\d+)\)/);
+        if (match) {
+            stats.tier3PromptChars.push(Number(match[2]));
+            stats.tier3PromptPinnedFacts.push(Number(match[3]));
+            stats.tier3PromptToolEvents.push(Number(match[4]));
+            stats.tier3PromptTranscriptExcerpts.push(Number(match[5]));
             continue;
         }
 
@@ -478,6 +491,10 @@ function buildReport(stats) {
             tier2DroppedPairs: summarizeArray(stats.tier2DroppedPairs),
             tier2ByteReductionRatio: summarizeArray(tier2Reductions),
             tier3SummarisedEntries: summarizeArray(stats.tier3SummarisedEntries),
+            tier3PromptChars: summarizeArray(stats.tier3PromptChars),
+            tier3PromptPinnedFacts: summarizeArray(stats.tier3PromptPinnedFacts),
+            tier3PromptToolEvents: summarizeArray(stats.tier3PromptToolEvents),
+            tier3PromptTranscriptExcerpts: summarizeArray(stats.tier3PromptTranscriptExcerpts),
             tier3SummaryChars: summarizeArray(stats.tier3SummaryChars),
             tier3Attempts: summarizeArray(stats.tier3Attempts),
             tier3Fallbacks: stats.tier3Fallbacks,
@@ -539,6 +556,7 @@ function summarizeComparison(deltas) {
         deltas.tier3DurationP95Ms,
         deltas.payloadEntryLossP95,
         deltas.tier3SummaryCharsP95,
+        deltas.tier3PromptCharsP95,
     ];
 
     if (highSignal.some(item => item.status === 'regressed')) {
@@ -603,6 +621,11 @@ export function compareReports(before, after) {
             before.contextFidelity.tier3SummaryChars.p95,
             after.contextFidelity.tier3SummaryChars.p95,
         ),
+        tier3PromptCharsP95: compareMetric(
+            'tier3PromptCharsP95',
+            before.contextFidelity.tier3PromptChars.p95,
+            after.contextFidelity.tier3PromptChars.p95,
+        ),
     };
 
     return {
@@ -639,6 +662,10 @@ function printHuman(report) {
     console.log(`- tier2DroppedPairs: ${formatSummary(report.contextFidelity.tier2DroppedPairs)}`);
     console.log(`- tier2ByteReductionRatio: ${formatSummary(report.contextFidelity.tier2ByteReductionRatio)}`);
     console.log(`- tier3SummarisedEntries: ${formatSummary(report.contextFidelity.tier3SummarisedEntries)}`);
+    console.log(`- tier3PromptChars: ${formatSummary(report.contextFidelity.tier3PromptChars)}`);
+    console.log(`- tier3PromptPinnedFacts: ${formatSummary(report.contextFidelity.tier3PromptPinnedFacts)}`);
+    console.log(`- tier3PromptToolEvents: ${formatSummary(report.contextFidelity.tier3PromptToolEvents)}`);
+    console.log(`- tier3PromptTranscriptExcerpts: ${formatSummary(report.contextFidelity.tier3PromptTranscriptExcerpts)}`);
     console.log(`- tier3SummaryChars: ${formatSummary(report.contextFidelity.tier3SummaryChars)}`);
     console.log(`- tier3Attempts: ${formatSummary(report.contextFidelity.tier3Attempts)}`);
     console.log(`- tier3Fallbacks: ${JSON.stringify(report.contextFidelity.tier3Fallbacks)}`);

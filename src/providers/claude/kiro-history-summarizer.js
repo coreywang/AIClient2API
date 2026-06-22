@@ -31,6 +31,15 @@ const SUMMARY_MIN_CHARS = 160;
 /** Retry once with a stricter prompt before falling back to rule-based summary. */
 const SUMMARY_MAX_ATTEMPTS = 2;
 
+/** Keep the summarisation request itself bounded; old tool output is locally compacted first. */
+const SUMMARY_PROMPT_MAX_CHARS = 28000;
+
+/** Bounds for deterministic coding-memory material sent to the summary call. */
+const PINNED_FACTS_MAX = 36;
+const TOOL_DIGEST_MAX = 48;
+const TRANSCRIPT_EXCERPTS_MAX = 64;
+const TOOL_RESULT_PREVIEW_CHARS = 900;
+
 /** System-prompt section wrapper for injected summaries. */
 const SUMMARY_SECTION_START = '\n\n<conversation_summary>\n';
 const SUMMARY_SECTION_END = '\n</conversation_summary>';
@@ -42,6 +51,217 @@ const SUMMARY_SECTION_END = '\n</conversation_summary>';
  */
 function payloadBytes(payload) {
     return Buffer.byteLength(JSON.stringify(payload), 'utf8');
+}
+
+function uniquePush(list, seen, value) {
+    const item = String(value || '').trim();
+    if (!item || seen.has(item)) return;
+    seen.add(item);
+    list.push(item);
+}
+
+function truncateMiddle(text, maxChars) {
+    const value = String(text || '');
+    if (value.length <= maxChars) return value;
+    const head = Math.floor(maxChars * 0.6);
+    const tail = Math.max(0, maxChars - head - 32);
+    return `${value.slice(0, head)}\n...[truncated ${value.length - head - tail} chars]...\n${value.slice(-tail)}`;
+}
+
+function compactWhitespace(text) {
+    return String(text || '').replace(/\r/g, '').replace(/[ \t]+/g, ' ').trim();
+}
+
+function extractPathCandidates(text) {
+    const value = String(text || '');
+    const matches = value.match(/(?:[A-Za-z]:\\[^\s"'`<>]+|(?:\.{1,2}\/|\/)?[\w@.-]+(?:\/[\w@.+-]+)+(?:\.[A-Za-z0-9_-]+)?)/g) || [];
+    return matches
+        .map(item => item.replace(/[),.;:\]]+$/g, ''))
+        .filter(item => item.length > 2 && !item.startsWith('http'));
+}
+
+function extractCommandCandidates(text) {
+    const value = String(text || '');
+    const commands = [];
+    const commandPatterns = [
+        /\b(?:npm|pnpm|yarn|node|npx|jest|vitest|pytest|python|python3|go|cargo|git|docker|docker-compose|kubectl|ssh|curl|rg|grep)\s+[^\n\r]+/g,
+        /\$ ([^\n\r]+)/g,
+    ];
+
+    for (const pattern of commandPatterns) {
+        for (const match of value.matchAll(pattern)) {
+            commands.push((match[1] || match[0]).trim());
+        }
+    }
+    return commands;
+}
+
+function extractHighSignalLines(text, maxLines = 12) {
+    const lines = String(text || '')
+        .split(/\r?\n/)
+        .map(line => line.trim())
+        .filter(Boolean);
+    const highSignal = lines.filter(line =>
+        /\b(error|failed|failure|exception|timeout|timed out|fatal|warn|warning|assert|expected|received|cannot|denied|not found|exit code|status: [45]\d\d)\b/i.test(line)
+    );
+    const selected = highSignal.length > 0 ? highSignal : lines.slice(-maxLines);
+    return selected.slice(0, maxLines);
+}
+
+function getToolResultText(toolResult) {
+    const content = toolResult?.content;
+    if (Array.isArray(content)) {
+        return content
+            .map(part => {
+                if (typeof part === 'string') return part;
+                if (part?.text) return part.text;
+                return '';
+            })
+            .filter(Boolean)
+            .join('\n');
+    }
+    if (typeof content === 'string') return content;
+    return '';
+}
+
+function summariseToolResult(toolResult) {
+    const text = getToolResultText(toolResult);
+    if (!text.trim()) return '[empty tool result]';
+
+    const paths = [];
+    const seenPaths = new Set();
+    for (const pathCandidate of extractPathCandidates(text)) {
+        uniquePush(paths, seenPaths, pathCandidate);
+        if (paths.length >= 8) break;
+    }
+
+    const commands = [];
+    const seenCommands = new Set();
+    for (const command of extractCommandCandidates(text)) {
+        uniquePush(commands, seenCommands, command);
+        if (commands.length >= 6) break;
+    }
+
+    const highSignal = extractHighSignalLines(text, 10);
+    const parts = [
+        `status=${toolResult.status || 'unknown'}`,
+        `chars=${text.length}`,
+    ];
+    if (paths.length > 0) parts.push(`paths=${paths.join(', ')}`);
+    if (commands.length > 0) parts.push(`commands=${commands.join(' | ')}`);
+    if (highSignal.length > 0) parts.push(`signal=${highSignal.join(' / ')}`);
+
+    return truncateMiddle(parts.join('; '), TOOL_RESULT_PREVIEW_CHARS);
+}
+
+function summariseToolInput(toolUse) {
+    const input = toolUse?.input || {};
+    const parts = [];
+
+    for (const key of ['file_path', 'path', 'notebook_path', 'file', 'cmd', 'command', 'pattern', 'query', 'url']) {
+        if (input[key]) parts.push(`${key}=${String(input[key]).slice(0, 240)}`);
+    }
+
+    if (parts.length === 0) {
+        const preview = JSON.stringify(input);
+        if (preview && preview !== '{}') parts.push(truncateMiddle(preview, 360));
+    }
+
+    return parts.join(', ');
+}
+
+function classifyUserFact(text) {
+    const value = compactWhitespace(text);
+    if (!value) return null;
+
+    if (/(不要|别|不能|必须|一定|优先|主要|只|不要|never|must|should|only|do not|don't|prefer)/i.test(value)) {
+        return `Constraint: ${truncateMiddle(value, 220)}`;
+    }
+    if (/(目标|任务|实现|修复|评估|部署|提交|推送|goal|task|implement|fix|evaluate|deploy|commit|push)/i.test(value)) {
+        return `User goal: ${truncateMiddle(value, 220)}`;
+    }
+    return `User context: ${truncateMiddle(value, 180)}`;
+}
+
+function buildDeterministicCodingMemory(entries) {
+    const pinnedFacts = [];
+    const toolDigest = [];
+    const transcript = [];
+    const seenFacts = new Set();
+    const seenTools = new Set();
+    const seenTranscript = new Set();
+
+    for (const entry of entries) {
+        const arm = entry.assistantResponseMessage;
+        const uim = entry.userInputMessage;
+
+        if (arm) {
+            if (arm.content && arm.content.trim()) {
+                const assistantText = compactWhitespace(arm.content);
+                if (/(decid|decision|fix|implemented|changed|updated|failed|error|commit|deploy|test|原因|结论|修复|实现|提交|部署|失败|错误)/i.test(assistantText)) {
+                    uniquePush(pinnedFacts, seenFacts, `Assistant finding: ${truncateMiddle(assistantText, 220)}`);
+                }
+                uniquePush(transcript, seenTranscript, `[Assistant] ${truncateMiddle(assistantText, 280)}`);
+            }
+
+            if (Array.isArray(arm.toolUses)) {
+                for (const tu of arm.toolUses) {
+                    const inputSummary = summariseToolInput(tu);
+                    const line = `[Tool call] ${tu.name || 'unknown'}${tu.toolUseId ? `#${tu.toolUseId}` : ''}${inputSummary ? `: ${inputSummary}` : ''}`;
+                    uniquePush(toolDigest, seenTools, line);
+
+                    for (const pathCandidate of extractPathCandidates(inputSummary)) {
+                        uniquePush(pinnedFacts, seenFacts, `File referenced: ${pathCandidate}`);
+                    }
+                    for (const command of extractCommandCandidates(inputSummary)) {
+                        uniquePush(pinnedFacts, seenFacts, `Command referenced: ${truncateMiddle(command, 180)}`);
+                    }
+                }
+            }
+        }
+
+        if (uim) {
+            if (uim.content && uim.content.trim()) {
+                const userFact = classifyUserFact(uim.content);
+                if (userFact) uniquePush(pinnedFacts, seenFacts, userFact);
+                uniquePush(transcript, seenTranscript, `[User] ${truncateMiddle(compactWhitespace(uim.content), 280)}`);
+            }
+
+            const toolResults = uim.userInputMessageContext?.toolResults;
+            if (Array.isArray(toolResults)) {
+                for (const tr of toolResults) {
+                    const resultSummary = summariseToolResult(tr);
+                    uniquePush(toolDigest, seenTools, `[Tool result] ${tr.toolUseId || 'unknown'}: ${resultSummary}`);
+
+                    for (const pathCandidate of extractPathCandidates(resultSummary)) {
+                        uniquePush(pinnedFacts, seenFacts, `File referenced: ${pathCandidate}`);
+                    }
+                    if (/\b(error|failed|failure|exception|timeout|fatal|exit code|status: [45]\d\d)\b/i.test(resultSummary)) {
+                        uniquePush(pinnedFacts, seenFacts, `Failure signal: ${truncateMiddle(resultSummary, 240)}`);
+                    }
+                }
+            }
+        }
+    }
+
+    return {
+        pinnedFacts: pinnedFacts.slice(-PINNED_FACTS_MAX),
+        toolDigest: toolDigest.slice(-TOOL_DIGEST_MAX),
+        transcript: transcript.slice(-TRANSCRIPT_EXCERPTS_MAX),
+        stats: {
+            entries: entries.length,
+            pinnedFacts: pinnedFacts.length,
+            toolDigest: toolDigest.length,
+            transcript: transcript.length,
+        },
+    };
+}
+
+function formatBulletSection(title, lines, emptyText = '- none observed') {
+    const body = lines.length > 0
+        ? lines.map(line => `- ${line}`).join('\n')
+        : emptyText;
+    return `${title}:\n${body}`;
 }
 
 /**
@@ -82,43 +302,43 @@ function isPureToolPair(assistantEntry, userEntry) {
  * @returns {string}
  */
 function buildSummaryPrompt(entries, retryAttempt = 0) {
+    const memory = buildDeterministicCodingMemory(entries);
     const lines = [
         retryAttempt > 0
-            ? 'The previous summary was too short or generic. Rewrite it as a dense operational memory for a coding assistant. Include concrete file paths, tool actions, decisions, errors, fixes, and unresolved next steps. Use 6-10 compact bullet points when possible. Do not answer that there is nothing to summarize unless the transcript is completely empty. Output only the summary text.\n'
-            : 'Summarize this earlier coding-assistant conversation as durable working memory for the next assistant turn. Prefer concrete facts over brevity: files touched, tool actions, user decisions, implementation choices, errors and fixes, and the current goal or next step. Use 6-10 compact bullet points when possible. If the segment is mostly tool calls/results, infer what was inspected or changed from tool names, inputs, and outputs. Output only the summary text.\n'
+            ? 'The previous coding memory was too short or generic. Rewrite it as dense structured working memory for a coding assistant. Preserve concrete file paths, commands, tests, errors, user constraints, decisions, current goal, and unresolved next steps. Output only the <coding_memory> block.\n'
+            : 'Summarize this earlier coding-assistant conversation as durable structured working memory for the next assistant turn. Preserve facts that matter for programming: exact file paths, commands/tests, errors, user constraints, implementation decisions, deployment/commit state, and open TODOs. Do not invent details. Output only the <coding_memory> block.\n',
+        'Use this exact structure and keep bullets compact:',
+        '<coding_memory>',
+        'User intent:',
+        '- ...',
+        'Hard constraints:',
+        '- ...',
+        'Repository facts:',
+        '- ...',
+        'Files touched:',
+        '- path: reason/current state',
+        'Decisions:',
+        '- ...',
+        'Failed attempts:',
+        '- ...',
+        'Commands/tests:',
+        '- command -> result',
+        'Open TODO:',
+        '- ...',
+        '</coding_memory>',
+        '',
+        `Deterministic extraction stats: entries=${memory.stats.entries}, pinnedFacts=${memory.stats.pinnedFacts}, toolEvents=${memory.stats.toolDigest}, transcriptExcerpts=${memory.stats.transcript}`,
+        formatBulletSection('Pinned facts extracted locally', memory.pinnedFacts),
+        formatBulletSection('Tool activity digest', memory.toolDigest),
+        formatBulletSection('Compact chronological excerpts', memory.transcript),
     ];
 
-    for (const entry of entries) {
-        const arm = entry.assistantResponseMessage;
-        const uim = entry.userInputMessage;
-
-        if (arm) {
-            if (arm.content && arm.content.trim()) {
-                lines.push(`[Assistant]: ${arm.content.trim().slice(0, 500)}`);
-            }
-            if (Array.isArray(arm.toolUses) && arm.toolUses.length > 0) {
-                for (const tu of arm.toolUses) {
-                    const inputPreview = JSON.stringify(tu.input ?? {}).slice(0, 500);
-                    lines.push(`[Tool call ${tu.toolUseId || 'unknown'}]: ${tu.name}(${inputPreview})`);
-                }
-            }
-        }
-
-        if (uim) {
-            if (uim.content && uim.content.trim()) {
-                lines.push(`[User]: ${uim.content.trim().slice(0, 500)}`);
-            }
-            const toolResults = uim.userInputMessageContext?.toolResults;
-            if (Array.isArray(toolResults) && toolResults.length > 0) {
-                for (const tr of toolResults) {
-                    const resultText = (tr.content?.[0]?.text ?? '').slice(0, 500);
-                    lines.push(`[Tool result: ${tr.toolUseId}]: ${resultText}`);
-                }
-            }
-        }
-    }
-
-    return lines.join('\n');
+    const prompt = truncateMiddle(lines.join('\n'), SUMMARY_PROMPT_MAX_CHARS);
+    logger.info(
+        `[Kiro] Tier-3 summary prompt compacted: ${entries.length} history entries -> ${prompt.length} chars ` +
+        `(pinnedFacts=${memory.pinnedFacts.length}, toolEvents=${memory.toolDigest.length}, transcriptExcerpts=${memory.transcript.length})`
+    );
+    return prompt;
 }
 
 function isInvalidSummary(summaryText) {
@@ -246,48 +466,19 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
  * Used as a fallback when the Kiro summary call fails.
  */
 function buildRuleBasedSummary(entries) {
-    const filesTouched = new Set();
-    const toolsCalled = [];
-    const textExchanges = [];
-
-    for (const entry of entries) {
-        const arm = entry.assistantResponseMessage;
-        const uim = entry.userInputMessage;
-
-        if (arm) {
-            if (arm.content && arm.content.trim()) {
-                textExchanges.push(arm.content.trim().slice(0, 120));
-            }
-            for (const tu of (arm.toolUses || [])) {
-                toolsCalled.push(tu.name);
-                // Heuristic: extract file paths from common tool inputs
-                const inp = tu.input || {};
-                const pathVal = inp.file_path || inp.path || inp.notebook_path || inp.file || '';
-                if (pathVal) filesTouched.add(pathVal);
-            }
-        }
-
-        if (uim && uim.content && uim.content.trim()) {
-            textExchanges.push(`User: ${uim.content.trim().slice(0, 120)}`);
-        }
-    }
-
-    const parts = [];
-    if (filesTouched.size > 0) {
-        parts.push(`Files referenced: ${[...filesTouched].join(', ')}`);
-    }
-    if (toolsCalled.length > 0) {
-        const counts = {};
-        for (const t of toolsCalled) counts[t] = (counts[t] || 0) + 1;
-        parts.push(`Tools used: ${Object.entries(counts).map(([k, v]) => `${k}×${v}`).join(', ')}`);
-    }
-    if (textExchanges.length > 0) {
-        parts.push(`Key exchanges:\n${textExchanges.slice(-5).join('\n')}`);
-    }
-
-    return parts.length > 0
-        ? parts.join('\n')
-        : `[${entries.length} earlier history entries compressed]`;
+    const memory = buildDeterministicCodingMemory(entries);
+    return [
+        '<coding_memory>',
+        formatBulletSection('User intent', memory.pinnedFacts.filter(line => line.startsWith('User goal') || line.startsWith('User context')).slice(-8)),
+        formatBulletSection('Hard constraints', memory.pinnedFacts.filter(line => line.startsWith('Constraint')).slice(-8)),
+        formatBulletSection('Repository facts', memory.pinnedFacts.filter(line => line.startsWith('Assistant finding') || line.startsWith('Failure signal')).slice(-10)),
+        formatBulletSection('Files touched', memory.pinnedFacts.filter(line => line.startsWith('File referenced')).slice(-12)),
+        'Decisions:\n- See repository facts and compact excerpts; model summary was unavailable.',
+        formatBulletSection('Failed attempts', memory.pinnedFacts.filter(line => line.startsWith('Failure signal')).slice(-8)),
+        formatBulletSection('Commands/tests', memory.pinnedFacts.filter(line => line.startsWith('Command referenced')).slice(-8)),
+        formatBulletSection('Open TODO', memory.transcript.slice(-8)),
+        '</coding_memory>',
+    ].join('\n');
 }
 
 // ── Main entry point ──────────────────────────────────────────────────────────

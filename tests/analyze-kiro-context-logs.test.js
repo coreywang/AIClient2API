@@ -13,6 +13,7 @@ const SAMPLE_LOG = [
     '[2026-06-22 12:00:00.000] [Req:a] [INFO] [Kiro] History compression triggered: 761048 bytes > 580000 bytes (history entries: 700)',
     '[2026-06-22 12:00:00.010] [Req:a] [INFO] [Kiro] Tier-2 trim result: 761048 -> 620000 bytes, 700 -> 600 history entries, dropped 50 pure tool pairs',
     '[2026-06-22 12:00:00.020] [Req:a] [INFO] [Kiro] Tier-3 summary: compressing 588 old history entries via Kiro',
+    '[2026-06-22 12:00:00.030] [Req:a] [INFO] [Kiro] Tier-3 summary prompt compacted: 588 history entries -> 28000 chars (pinnedFacts=36, toolEvents=48, transcriptExcerpts=64)',
     '[2026-06-22 12:00:01.000] [Req:a] [INFO] [Kiro] Tier-3 summary generated: 6001 chars (attempts=2, durationMs=990, fallback=none)',
     '[2026-06-22 12:00:01.010] [Req:a] [INFO] [Kiro] After Tier-3 compression: 620000 -> 500000 bytes (12 history entries)',
     '[2026-06-22 12:00:02.000] [Req:b] [INFO] [Kiro] Payload trimmed: 761048 -> 599085 bytes, 700 -> 551 history entries',
@@ -23,6 +24,7 @@ const IMPROVED_LOG = [
     '[2026-06-22 13:00:00.000] [Req:d] [INFO] [Kiro] History compression triggered: 700000 bytes > 580000 bytes (history entries: 620)',
     '[2026-06-22 13:00:00.010] [Req:d] [INFO] [Kiro] Tier-2 trim result: 700000 -> 610000 bytes, 620 -> 590 history entries, dropped 15 pure tool pairs',
     '[2026-06-22 13:00:00.020] [Req:d] [INFO] [Kiro] Tier-3 summary: compressing 578 old history entries via Kiro',
+    '[2026-06-22 13:00:00.030] [Req:d] [INFO] [Kiro] Tier-3 summary prompt compacted: 578 history entries -> 16000 chars (pinnedFacts=20, toolEvents=30, transcriptExcerpts=40)',
     '[2026-06-22 13:00:00.250] [Req:d] [INFO] [Kiro] Tier-3 summary generated: 4200 chars (attempts=1, durationMs=230, fallback=none)',
     '[2026-06-22 13:00:00.260] [Req:d] [INFO] [Kiro] After Tier-3 compression: 610000 -> 510000 bytes (12 history entries)',
 ].join('\n');
@@ -44,6 +46,10 @@ describe('analyze-kiro-context-logs', () => {
         expect(report.latency.tier3DurationMs.p95).toBe(990);
         expect(report.contextFidelity.tier2DroppedPairs.max).toBe(50);
         expect(report.contextFidelity.tier3SummarisedEntries.max).toBe(588);
+        expect(report.contextFidelity.tier3PromptChars.max).toBe(28000);
+        expect(report.contextFidelity.tier3PromptPinnedFacts.max).toBe(36);
+        expect(report.contextFidelity.tier3PromptToolEvents.max).toBe(48);
+        expect(report.contextFidelity.tier3PromptTranscriptExcerpts.max).toBe(64);
         expect(report.contextFidelity.tier3SummaryChars.max).toBe(6001);
         expect(report.upstreamLimitSignals.payloadFinalBytes.max).toBe(599085);
         expect(report.assessment.parameterInteraction.status).toBe('warn');
@@ -61,7 +67,7 @@ describe('analyze-kiro-context-logs', () => {
             const report = analyzeLogPaths([dir]);
 
             expect(report.files).toEqual([join(dir, 'app-2026-06-22.log')]);
-            expect(report.window.totalLines).toBe(7);
+            expect(report.window.totalLines).toBe(8);
             expect(report.triggers.compressionTriggered).toBe(1);
         } finally {
             rmSync(dir, { recursive: true, force: true });
@@ -100,6 +106,7 @@ describe('analyze-kiro-context-logs', () => {
         expect(comparison.deltas.limitErrors.status).toBe('improved');
         expect(comparison.deltas.tier3DurationP95Ms.status).toBe('improved');
         expect(comparison.deltas.tier3SummaryCharsP95.status).toBe('improved');
+        expect(comparison.deltas.tier3PromptCharsP95.status).toBe('improved');
         expect(comparison.assessment.status).toBe('improved');
     });
 

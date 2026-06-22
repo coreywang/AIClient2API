@@ -5,6 +5,7 @@
 - `compressHistory` 触发阈值：`580000` bytes
 - `guardPayload` 本地安全预算：`600000` bytes
 - Tier-3 summary 注入上限：`6000` chars
+- Tier-3 summary 请求 prompt 上限：约 `28000` chars，本地先提取 coding memory / pinned facts / tool digest
 - 上游 payload 边界不写死为固定合同，以线上错误和实测为准
 
 ## 快速分析
@@ -101,6 +102,7 @@ docker logs aiclient2api | npm run analyze:kiro-context -- - --json
 重点看：
 
 - `tier3DurationMs`
+- `tier3PromptChars`
 - `tier3Attempts`
 - `tier3Fallbacks`
 - `tier3InvalidAttempts`
@@ -129,6 +131,7 @@ docker logs aiclient2api | npm run analyze:kiro-context -- - --json
 
 - Tier-2 删除的是纯 tool pairs，保真度损失通常低于直接删除文本对话。
 - Tier-3 是保真度和 payload 的折中，`summaryChars` 长期贴近 `6001` 表示摘要经常打满上限，可能还会丢细节。
+- `tier3PromptChars` 长期贴近 `28000` 表示旧历史本地压缩后仍经常打满 prompt 上限，需要继续减少工具输出或做增量 summary。
 - `payloadEntryLossRatio` 高说明 guard 兜底裁剪过重，应优先让压缩在 580KB 阶段完成，而不是依赖 guard。
 
 ## 线上观测建议
@@ -140,4 +143,5 @@ docker logs aiclient2api | npm run analyze:kiro-context -- - --json
 - `tier3DurationMs` p95 是否可接受
 - `payloadTrimmed` 是否只是兜底而不是主路径
 - `summaryChars` 是否经常贴近 6001
+- `tier3PromptChars` 是否从大段旧 history 降到 28000 以内，且不长期打满
 - 用户侧是否反馈旧上下文丢失
