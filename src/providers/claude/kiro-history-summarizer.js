@@ -23,7 +23,7 @@ import logger from '../../utils/logger.js';
 const RECENT_TURNS = 6;
 
 /** Hard cap on summary text length to avoid re-inflating the payload. */
-const SUMMARY_MAX_CHARS = 16000;
+const SUMMARY_MAX_CHARS = 6000;
 
 /** Summaries shorter than this usually indicate a placeholder or empty reply. */
 const SUMMARY_MIN_CHARS = 160;
@@ -199,8 +199,12 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
     logger.info(`[Kiro] Tier-3 summary: compressing ${toSummarise.length} old history entries via Kiro`);
 
     let summaryText = '';
+    let attempts = 0;
+    let fallback = 'none';
+    const startedAt = Date.now();
     try {
         for (let attempt = 0; attempt < SUMMARY_MAX_ATTEMPTS; attempt++) {
+            attempts = attempt + 1;
             const prompt = buildSummaryPrompt(toSummarise, attempt);
             summaryText = await callKiro(prompt);
             if (!isInvalidSummary(summaryText)) break;
@@ -208,18 +212,24 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
         }
         if (isInvalidSummary(summaryText)) {
             logger.warn(`[Kiro] Tier-3 summary invalid (${(summaryText || '').trim().length} chars), using rule-based fallback`);
+            fallback = 'invalid_summary';
             summaryText = buildRuleBasedSummary(toSummarise);
         }
         // Truncate to hard cap
         if (summaryText.length > SUMMARY_MAX_CHARS) {
             summaryText = summaryText.slice(0, SUMMARY_MAX_CHARS) + '…';
         }
-        logger.info(`[Kiro] Tier-3 summary generated: ${summaryText.length} chars`);
     } catch (err) {
         // Summary generation failed — fall back to a minimal rule-based digest
         logger.warn(`[Kiro] Tier-3 summary call failed (${err.message}), using rule-based fallback`);
+        fallback = 'call_failed';
+        attempts = Math.max(attempts, 1);
         summaryText = buildRuleBasedSummary(toSummarise);
     }
+    logger.info(
+        `[Kiro] Tier-3 summary generated: ${summaryText.length} chars ` +
+        `(attempts=${attempts}, durationMs=${Date.now() - startedAt}, fallback=${fallback})`
+    );
 
     // Remove the summarised entries from history
     history.splice(0, recentStart);
@@ -300,14 +310,21 @@ export async function compressHistory(payload, systemPrompt, maxBytes, callKiro,
     const history = payload?.conversationState?.history;
     if (!Array.isArray(history) || history.length === 0) return systemPrompt;
 
-    if (payloadBytes(payload) <= maxBytes) return systemPrompt;
+    const beforeBytes = payloadBytes(payload);
+    if (beforeBytes <= maxBytes) return systemPrompt;
 
-    logger.info(`[Kiro] History compression triggered: ${payloadBytes(payload)} bytes > ${maxBytes} bytes`);
+    const beforeEntries = history.length;
+    logger.info(`[Kiro] History compression triggered: ${beforeBytes} bytes > ${maxBytes} bytes (history entries: ${beforeEntries})`);
 
     // Tier 2 — drop pure tool pairs
-    dropOldToolPairs(history, payload, maxBytes, recentTurns);
+    const droppedToolPairs = dropOldToolPairs(history, payload, maxBytes, recentTurns);
+    const afterTier2Bytes = payloadBytes(payload);
+    logger.info(
+        `[Kiro] Tier-2 trim result: ${beforeBytes} -> ${afterTier2Bytes} bytes, ` +
+        `${beforeEntries} -> ${history.length} history entries, dropped ${droppedToolPairs} pure tool pairs`
+    );
 
-    if (payloadBytes(payload) <= maxBytes) {
+    if (afterTier2Bytes <= maxBytes) {
         logger.info('[Kiro] Tier-2 trim sufficient, skipping summary');
         return systemPrompt;
     }
@@ -316,7 +333,7 @@ export async function compressHistory(payload, systemPrompt, maxBytes, callKiro,
     const updatedSystemPrompt = await summariseOldHistory(payload, systemPrompt, callKiro, recentTurns);
 
     const afterBytes = payloadBytes(payload);
-    logger.info(`[Kiro] After Tier-3 compression: ${afterBytes} bytes`);
+    logger.info(`[Kiro] After Tier-3 compression: ${afterTier2Bytes} -> ${afterBytes} bytes (${history.length} history entries)`);
 
     return updatedSystemPrompt;
 }

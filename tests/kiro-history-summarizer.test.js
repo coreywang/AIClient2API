@@ -353,7 +353,7 @@ describe('summariseOldHistory', () => {
         expect(result).not.toContain('No content to summarize.');
     });
 
-    test('truncates a very long summary to ~16000 chars with ellipsis', async () => {
+    test('truncates a very long summary to ~6000 chars with ellipsis', async () => {
         const history = [
             ...makeTextPair('old'),
             ...makeTextPair('recent'),
@@ -364,12 +364,12 @@ describe('summariseOldHistory', () => {
 
         const result = await summariseOldHistory(payload, '', callKiro, 1);
 
-        // The injected summary portion must be capped (16000 chars + one '…' character)
+        // The injected summary portion must be capped (6000 chars + one '…' character)
         const start = result.indexOf('<conversation_summary>');
         const end = result.indexOf('</conversation_summary>');
         const injectedSection = result.slice(start, end);
-        // 16001 summary chars + surrounding wrapper text — well under 17500
-        expect(injectedSection.length).toBeLessThan(17500);
+        // 6001 summary chars + surrounding wrapper text - well under 7500
+        expect(injectedSection.length).toBeLessThan(7500);
         expect(result).toContain('…');
     });
 

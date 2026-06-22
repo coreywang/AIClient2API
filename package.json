@@ -44,6 +44,7 @@
     "test:unit": "node run-tests.js --unit",
     "test:integration": "node run-tests.js --integration",
     "test:summary": "node test-summary.js",
+    "analyze:kiro-context": "node src/scripts/analyze-kiro-context-logs.js",
     "help": "node src/scripts/help.js",
     "example:api": "node src/scripts/example-api.js"
   }
