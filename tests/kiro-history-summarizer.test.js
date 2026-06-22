@@ -253,6 +253,41 @@ describe('summariseOldHistory', () => {
         expect(callKiro.mock.calls[0][0].length).toBeGreaterThan(0);
     });
 
+    test('summary prompt preserves tool details for sparse tool-heavy history', async () => {
+        const history = [
+            ...makePurePair('t1'),
+            ...makeTextPair('recent text'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
+
+        await summariseOldHistory(payload, '', callKiro, 1);
+
+        const prompt = callKiro.mock.calls[0][0];
+        expect(prompt).toContain('durable working memory');
+        expect(prompt).toContain('[Tool call t1]: Read');
+        expect(prompt).toContain('/src/t1.js');
+        expect(prompt).toContain('[Tool result: t1]');
+    });
+
+    test('retries once when callKiro returns a too-short summary', async () => {
+        const history = [
+            ...makeTextPair('old implementation detail', 'old user decision'),
+            ...makeTextPair('recent'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn()
+            .mockResolvedValueOnce('Too short.')
+            .mockResolvedValueOnce(makeValidSummary('Retried valid summary'));
+
+        const result = await summariseOldHistory(payload, '', callKiro, 1);
+
+        expect(callKiro).toHaveBeenCalledTimes(2);
+        expect(callKiro.mock.calls[1][0]).toContain('previous summary was too short');
+        expect(result).toContain('Retried valid summary');
+        expect(result).not.toContain('Key exchanges:');
+    });
+
     test('injects summary wrapped in <conversation_summary> tags', async () => {
         const history = [
             ...makeTextPair('old text'),

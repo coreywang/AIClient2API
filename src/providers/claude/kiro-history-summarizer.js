@@ -26,7 +26,10 @@ const RECENT_TURNS = 6;
 const SUMMARY_MAX_CHARS = 4000;
 
 /** Summaries shorter than this usually indicate a placeholder or empty reply. */
-const SUMMARY_MIN_CHARS = 200;
+const SUMMARY_MIN_CHARS = 160;
+
+/** Retry once with a stricter prompt before falling back to rule-based summary. */
+const SUMMARY_MAX_ATTEMPTS = 2;
 
 /** System-prompt section wrapper for injected summaries. */
 const SUMMARY_SECTION_START = '\n\n<conversation_summary>\n';
@@ -78,8 +81,12 @@ function isPureToolPair(assistantEntry, userEntry) {
  * @param {Array} entries - Kiro history entries (may be assistant or user turns)
  * @returns {string}
  */
-function buildSummaryPrompt(entries) {
-    const lines = ['Below is a segment of a prior coding-assistant conversation. Produce a concise summary (max 400 words) that captures: files touched, key decisions made, errors encountered and how they were resolved, and the current overall goal. Output only the summary text, no preamble.\n'];
+function buildSummaryPrompt(entries, retryAttempt = 0) {
+    const lines = [
+        retryAttempt > 0
+            ? 'The previous summary was too short or generic. Rewrite it as a dense operational memory for a coding assistant. Include concrete file paths, tool actions, decisions, errors, fixes, and unresolved next steps. Use 6-10 compact bullet points when possible. Do not answer that there is nothing to summarize unless the transcript is completely empty. Output only the summary text.\n'
+            : 'Summarize this earlier coding-assistant conversation as durable working memory for the next assistant turn. Prefer concrete facts over brevity: files touched, tool actions, user decisions, implementation choices, errors and fixes, and the current goal or next step. Use 6-10 compact bullet points when possible. If the segment is mostly tool calls/results, infer what was inspected or changed from tool names, inputs, and outputs. Output only the summary text.\n'
+    ];
 
     for (const entry of entries) {
         const arm = entry.assistantResponseMessage;
@@ -91,8 +98,8 @@ function buildSummaryPrompt(entries) {
             }
             if (Array.isArray(arm.toolUses) && arm.toolUses.length > 0) {
                 for (const tu of arm.toolUses) {
-                    const inputPreview = JSON.stringify(tu.input ?? {}).slice(0, 200);
-                    lines.push(`[Tool call]: ${tu.name}(${inputPreview})`);
+                    const inputPreview = JSON.stringify(tu.input ?? {}).slice(0, 500);
+                    lines.push(`[Tool call ${tu.toolUseId || 'unknown'}]: ${tu.name}(${inputPreview})`);
                 }
             }
         }
@@ -104,7 +111,7 @@ function buildSummaryPrompt(entries) {
             const toolResults = uim.userInputMessageContext?.toolResults;
             if (Array.isArray(toolResults) && toolResults.length > 0) {
                 for (const tr of toolResults) {
-                    const resultText = (tr.content?.[0]?.text ?? '').slice(0, 200);
+                    const resultText = (tr.content?.[0]?.text ?? '').slice(0, 500);
                     lines.push(`[Tool result: ${tr.toolUseId}]: ${resultText}`);
                 }
             }
@@ -193,8 +200,12 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
 
     let summaryText = '';
     try {
-        const prompt = buildSummaryPrompt(toSummarise);
-        summaryText = await callKiro(prompt);
+        for (let attempt = 0; attempt < SUMMARY_MAX_ATTEMPTS; attempt++) {
+            const prompt = buildSummaryPrompt(toSummarise, attempt);
+            summaryText = await callKiro(prompt);
+            if (!isInvalidSummary(summaryText)) break;
+            logger.warn(`[Kiro] Tier-3 summary invalid on attempt ${attempt + 1} (${(summaryText || '').trim().length} chars)`);
+        }
         if (isInvalidSummary(summaryText)) {
             logger.warn(`[Kiro] Tier-3 summary invalid (${(summaryText || '').trim().length} chars), using rule-based fallback`);
             summaryText = buildRuleBasedSummary(toSummarise);

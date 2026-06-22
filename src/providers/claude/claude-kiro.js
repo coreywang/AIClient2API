@@ -60,7 +60,7 @@ const KIRO_CONSTANTS = {
 
 const KIRO_CONTEXT_LIMITS = {
     // Feature 1: Payload guard
-    MAX_PAYLOAD_BYTES: 580000,          // Keep below guardPayload's 600KB hard limit so summary injection does not trigger extra hard trimming
+    MAX_PAYLOAD_BYTES: 1000000,         // Raised to 1MB; monitor for 413 errors and reduce if needed
     AUTO_TRIM_PAYLOAD: true,
 
     // Feature 2: Content-length error retry
@@ -1120,8 +1120,47 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build CodeWhisperer request from OpenAI messages
      */
-    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, prevTruncation = null) {
+    async buildCodewhispererRequest(messages, model, tools = null, inSystemPrompt = null, thinking = null, prevTruncation = null, options = {}) {
         const conversationId = uuidv4();
+        const codewhispererModel = MODEL_MAPPING[model] || model;
+
+        if (options.summaryCall) {
+            const promptMessage = messages[messages.length - 1];
+            const promptText = this.getContentText(promptMessage?.content ?? promptMessage);
+            if (!promptText || !promptText.trim()) {
+                throw new Error('No summary prompt found');
+            }
+
+            const request = {
+                conversationState: {
+                    agentTaskType: "vibe",
+                    chatTriggerType: KIRO_CONSTANTS.CHAT_TRIGGER_TYPE_MANUAL,
+                    conversationId,
+                    currentMessage: {
+                        userInputMessage: {
+                            content: promptText,
+                            modelId: codewhispererModel,
+                            origin: KIRO_CONSTANTS.ORIGIN_AI_EDITOR
+                        }
+                    }
+                }
+            };
+
+            if (this.authMethod === KIRO_CONSTANTS.AUTH_METHOD_SOCIAL) {
+                request.profileArn = this.profileArn;
+            }
+
+            Object.defineProperty(request, '_kiroToolNameMaps', {
+                value: buildKiroToolNameMaps(null),
+                enumerable: false
+            });
+            Object.defineProperty(request, '_isPlaceholderOnly', {
+                value: false,
+                enumerable: false
+            });
+
+            return request;
+        }
         
         // 内置的 systemPrompt 前缀
         const builtInPrefix = `<CRITICAL_OVERRIDE>
@@ -1217,7 +1256,6 @@ async saveCredentialsToFile(filePath, newData) {
         processedMessages.length = 0;
         processedMessages.push(...mergedMessages);
 
-        const codewhispererModel = MODEL_MAPPING[model] || model;
         const toolNameMaps = buildKiroToolNameMaps(tools);
         
         // 动态压缩 tools（保留全部工具，但过滤掉 web_search/websearch）
@@ -1852,7 +1890,15 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body._prevTruncation);
+        const requestData = await this.buildCodewhispererRequest(
+            messages,
+            model,
+            body.tools,
+            body.system,
+            body.thinking,
+            body._prevTruncation,
+            { summaryCall: body._summaryCall === true }
+        );
 
         try {
             const token = this.accessToken; // Use the already initialized token
@@ -2464,7 +2510,15 @@ async saveCredentialsToFile(filePath, newData) {
             throw new Error('No messages found in request body');
         }
 
-        const requestData = await this.buildCodewhispererRequest(messages, model, body.tools, body.system, body.thinking, body._prevTruncation);
+        const requestData = await this.buildCodewhispererRequest(
+            messages,
+            model,
+            body.tools,
+            body.system,
+            body.thinking,
+            body._prevTruncation,
+            { summaryCall: body._summaryCall === true }
+        );
         const toolNameMaps = requestData._kiroToolNameMaps;
 
         const token = this.accessToken;
