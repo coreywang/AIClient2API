@@ -1649,6 +1649,15 @@ async saveCredentialsToFile(filePath, newData) {
             enumerable: false
         });
 
+        // Mark whether only the placeholder tool is present — callers can use this to suppress
+        // spurious JSON-validation warnings when Kiro calls the placeholder with garbage args.
+        const toolList = toolsContext.tools || [];
+        const isPlaceholderOnly = toolList.length === 1 && toolList[0]?.toolSpecification?.name === 'no_tool_available';
+        Object.defineProperty(request, '_isPlaceholderOnly', {
+            value: isPlaceholderOnly,
+            enumerable: false
+        });
+
         // 监控钩子：内部请求转换
         if (this.config?._monitorRequestId) {
             try {
@@ -1869,6 +1878,7 @@ async saveCredentialsToFile(filePath, newData) {
                 releaseThrottle();
             }
             response._kiroToolNameMaps = requestData._kiroToolNameMaps;
+            response._isPlaceholderOnly = requestData._isPlaceholderOnly;
             return response;
         } catch (error) {
             const status = error.response?.status;
@@ -2196,6 +2206,7 @@ async saveCredentialsToFile(filePath, newData) {
 
     _processApiResponse(response) {
         const toolNameMaps = response?._kiroToolNameMaps;
+        const isPlaceholderOnly = response?._isPlaceholderOnly === true;
         const rawResponseText = Buffer.isBuffer(response.data) ? response.data.toString('utf8') : String(response.data);
         //logger.info(`[Kiro] Raw response length: ${rawResponseText.length}`);
         if (rawResponseText.includes("[Called")) {
@@ -2237,7 +2248,7 @@ async saveCredentialsToFile(filePath, newData) {
         
         //logger.info(`[Kiro] Final response text after tool call cleanup: ${fullResponseText}`);
         //logger.info(`[Kiro] Final tool calls after deduplication: ${JSON.stringify(uniqueToolCalls)}`);
-        return { responseText: fullResponseText, toolCalls: uniqueToolCalls };
+        return { responseText: fullResponseText, toolCalls: uniqueToolCalls, isPlaceholderOnly };
     }
 
     async generateContent(model, requestBody) {
@@ -2269,7 +2280,7 @@ async saveCredentialsToFile(filePath, newData) {
         try {
             // Save raw response text before processing for accurate truncation detection (T6)
             const rawResponseData = Buffer.isBuffer(response.data) ? response.data.toString('utf8') : String(response.data);
-            const { responseText, toolCalls } = this._processApiResponse(response);
+            const { responseText, toolCalls, isPlaceholderOnly } = this._processApiResponse(response);
             const thinkingType = requestBody?.thinking?.type;
             const thinkingRequested = typeof thinkingType === 'string' &&
                 (thinkingType.toLowerCase() === 'enabled' || thinkingType.toLowerCase() === 'adaptive');
@@ -2294,7 +2305,7 @@ async saveCredentialsToFile(filePath, newData) {
                 }
             }
 
-            return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens);
+            return this.buildClaudeResponse(contentForClaude, false, 'assistant', model, toolCalls, inputTokens, isPlaceholderOnly);
         } catch (error) {
             logger.error('[Kiro] Error in generateContent:', error);
             throw error;
@@ -2917,7 +2928,7 @@ async saveCredentialsToFile(filePath, newData) {
                                 try {
                                     parsedInput = JSON.parse(currentToolCall.input);
                                 } catch (e) {
-                                    // input 不是有效 JSON，保持原样
+                                    logger.warn(`[Kiro] Truncated tool arguments on tool switch for '${currentToolCall.name}'. Error: ${e.message}`);
                                 }
                                 toolCalls.push({
                                     toolUseId: currentToolCall.toolUseId,
@@ -2972,7 +2983,7 @@ async saveCredentialsToFile(filePath, newData) {
                             try {
                                 parsedInput = JSON.parse(currentToolCall.input);
                             } catch (e) {
-                                // input 不是有效 JSON，保持原样
+                                logger.warn(`[Kiro] Truncated tool arguments on stop event for '${currentToolCall.name}'. Error: ${e.message}`);
                             }
                             toolCalls.push({
                                 toolUseId: currentToolCall.toolUseId,
@@ -3020,7 +3031,7 @@ async saveCredentialsToFile(filePath, newData) {
                         try {
                             parsedInput = JSON.parse(currentToolCall.input);
                         } catch (e) {
-                            // input 不是有效 JSON，保持原样
+                            logger.warn(`[Kiro] Truncated tool arguments on toolUseStop for '${currentToolCall.name}'. Error: ${e.message}`);
                         }
                         toolCalls.push({
                             toolUseId: currentToolCall.toolUseId,
@@ -3043,7 +3054,9 @@ async saveCredentialsToFile(filePath, newData) {
                 let parsedInput = currentToolCall.input;
                 try {
                     parsedInput = JSON.parse(currentToolCall.input);
-                } catch (e) {}
+                } catch (e) {
+                    logger.warn(`[Kiro] Truncated tool arguments at stream end for '${currentToolCall.name}'. Error: ${e.message}`);
+                }
                 toolCalls.push({
                     toolUseId: currentToolCall.toolUseId,
                     name: currentToolCall.name,
@@ -3198,7 +3211,7 @@ async saveCredentialsToFile(filePath, newData) {
     /**
      * Build Claude compatible response object
      */
-    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0) {
+    buildClaudeResponse(content, isStream = false, role = 'assistant', model, toolCalls = null, inputTokens = 0, isPlaceholderOnly = false) {
         const messageId = `${uuidv4()}`;
 
         if (isStream) {
@@ -3268,9 +3281,9 @@ async saveCredentialsToFile(filePath, newData) {
                         const args = tc.function.arguments;
                         inputObject = typeof args === 'string' ? JSON.parse(args) : args;
                     } catch (e) {
-                        logger.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
+                        if (!isPlaceholderOnly) {
+                            logger.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
+                        }
                         inputObject = { "raw_arguments": tc.function.arguments };
                     }
                     // 2. content_block_start for each tool_use
@@ -3364,9 +3377,9 @@ async saveCredentialsToFile(filePath, newData) {
                         const args = tc.function.arguments;
                         inputObject = typeof args === 'string' ? JSON.parse(args) : args;
                     } catch (e) {
-                        logger.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
-                        // If parsing fails, wrap the raw string in an object as a fallback,
-                        // since Claude's `input` field expects an object.
+                        if (!isPlaceholderOnly) {
+                            logger.warn(`[Kiro] Invalid JSON for tool call arguments. Wrapping in raw_arguments. Error: ${e.message}`, tc.function.arguments);
+                        }
                         inputObject = { "raw_arguments": tc.function.arguments };
                     }
                     contentArray.push({
