@@ -4,7 +4,7 @@
  * Oversized Kiro payloads can fail with misleading upstream errors. The exact
  * upstream boundary is not treated as a fixed contract here; this module provides:
  * - Pre-flight size checking
- * - Auto-trimming of oldest history entries to fit under a local safety budget
+ * - Auto-trimming of oldest non-tool history entries to fit under a local safety budget
  * - Orphaned toolResult repair after trimming
  *
  * Ported from KiroProxy/kiro_proxy/payload_guards.py
@@ -33,6 +33,14 @@ function stripEmptyToolUses(history) {
     }
 }
 
+function isToolHistoryEntry(entry) {
+    const toolUses = entry?.assistantResponseMessage?.toolUses;
+    if (Array.isArray(toolUses) && toolUses.length > 0) return true;
+
+    const toolResults = entry?.userInputMessage?.userInputMessageContext?.toolResults;
+    return Array.isArray(toolResults) && toolResults.length > 0;
+}
+
 /**
  * Ensure history starts with a userInputMessage entry.
  * Modifies history in-place.
@@ -40,7 +48,7 @@ function stripEmptyToolUses(history) {
  */
 export function alignToUserMessage(history) {
     const originalLen = history.length;
-    while (history.length > 0 && !('userInputMessage' in history[0])) {
+    while (history.length > 0 && !('userInputMessage' in history[0]) && !isToolHistoryEntry(history[0])) {
         history.shift();
     }
     if (history.length === 0 && originalLen > 0) {
@@ -90,7 +98,7 @@ export function repairOrphanedToolResults(history) {
 }
 
 /**
- * Trim oldest history entries to fit payload under size limit.
+ * Trim oldest non-tool history entries to fit payload under size limit.
  * Modifies payload in-place.
  *
  * @param {object} payload - The full Kiro API request payload
@@ -114,9 +122,13 @@ export function trimPayloadToLimit(payload, maxBytes = MAX_PAYLOAD_BYTES) {
     // Strip empty toolUses first (reduces size with no information loss)
     stripEmptyToolUses(history);
 
-    // Trim oldest entries until under limit (keep at least 2 entries)
+    // Trim oldest non-tool entries until under limit (keep at least 2 entries).
+    // Tool call/results carry exact coding state, so keep them raw even if that
+    // means the request remains above the local heuristic budget.
     while (history.length > 2 && checkPayloadSize(payload) > maxBytes) {
-        history.shift();
+        const index = history.findIndex(entry => !isToolHistoryEntry(entry));
+        if (index < 0) break;
+        history.splice(index, 1);
     }
 
     // Ensure history starts with a user message

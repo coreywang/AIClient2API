@@ -2,13 +2,12 @@
  * Tests for kiro-history-summarizer.js
  *
  * Covers:
- *   - dropOldToolPairs: no-op under limit, removes pure pairs from old section,
- *     never touches recent window, ignores text-only pairs
+ *   - dropOldToolPairs: compatibility no-op that preserves tool call/results
  *   - summariseOldHistory: no-op when everything is in recent window, calls
- *     callKiro and injects summary, removes summarised entries, falls back on
- *     error, truncates very long summaries
- *   - compressHistory: no-op under limit, skips callKiro when tier-2 suffices,
- *     calls callKiro when tier-2 is not enough, returns updated systemPrompt
+ *     callKiro and injects summary, removes only summarised non-tool entries,
+ *     preserves raw tool entries, falls back on error, truncates very long summaries
+ *   - compressHistory: no-op under limit, preserves tools during tier-2,
+ *     calls callKiro for old non-tool history, returns updated systemPrompt
  */
 
 import {
@@ -28,6 +27,14 @@ function makeToolResult(id = 'tu1') {
         toolUseId: id,
         content: [{ text: `result for ${id}` }],
         status: 'success',
+    };
+}
+
+function makeToolResultWithText(id, text, status = 'success') {
+    return {
+        toolUseId: id,
+        content: [{ text }],
+        status,
     };
 }
 
@@ -92,7 +99,7 @@ describe('dropOldToolPairs', () => {
         expect(payload.conversationState.history.length).toBe(6);
     });
 
-    test('removes pure tool pairs from the oldest end until under limit', () => {
+    test('preserves pure tool pairs even when over limit', () => {
         // 2 old pure pairs + 1 text pair + 1 pure pair inside recent window
         const history = [
             ...makePurePair('t1'),   // old — eligible for removal
@@ -102,66 +109,27 @@ describe('dropOldToolPairs', () => {
         ];
         const payload = makePayload(history);
         // maxBytes=0 forces maximum trimming; recentTurns=2 protects last 4 entries
-        dropOldToolPairs(payload.conversationState.history, payload, 0, 2);
+        const removed = dropOldToolPairs(payload.conversationState.history, payload, 0, 2);
 
         const ids = payload.conversationState.history
             .flatMap(e => e.assistantResponseMessage?.toolUses ?? [])
             .map(tu => tu.toolUseId);
 
-        expect(ids).not.toContain('t1');
-        expect(ids).not.toContain('t2');
+        expect(removed).toBe(0);
+        expect(ids).toContain('t1');
+        expect(ids).toContain('t2');
+        expect(ids).toContain('t3');
     });
 
-    test('never removes entries that fall inside the recent window', () => {
-        // Layout (recentTurns=2 → last 4 entries = last 2 turns are protected):
-        //   index 0-1: old pure pair  → eligible to remove
-        //   index 2-3: old text pair  → not a pure pair, loop skips (+2) and then
-        //                               i=4 >= recentStart-1=3, so loop exits
-        //   index 4-5: recent pure pair 'r1' → protected
-        //   index 6-7: recent pure pair 'r2' → protected
-        //
-        // recentStart = max(0, 8 - 2*2) = 4
-        // The loop walks with i starting at 0, bound i < recentStart-1 = 3:
-        //   i=0: pure pair 'old' → splice, removed=1; array shrinks to 6; i stays 0
-        //   i=0: text pair at new[0] → not pure, i += 2 → i=2
-        //   i=2: 2 < 3 → true; history[2] is now 'r1' assistant entry
-        //         but isPureToolPair(history[2], history[3]) = true — this WOULD remove r1
-        //         UNLESS the text pair blocks the advance before we reach here.
-        //
-        // To reliably protect the recent window we need at least one non-pure pair
-        // in the old section AFTER the pure pairs, which causes i to advance past
-        // the recentStart-1 bound before reaching the recent entries.
-        //
-        // Concrete layout that works:
-        //   old pure pair 'old1'  (removed by loop)
-        //   old text pair         (not pure → i advances to 4, loop exits because 4 >= recentStart-1=5)
-        //   old text pair         (together with above, old section has 4 entries: recentStart=4)
-        //   recent pure 'r1'      (protected)
-        //   recent pure 'r2'      (protected)
-        //
-        // Actually simpler: use large recentTurns so the boundary is far enough out.
-        // With 3 pure pairs (6 entries) and recentTurns=3, recentStart = max(0,6-6)=0,
-        // so nothing is in the old section and the loop does nothing at all.
-        //
-        // Cleanest reliable approach: put pure pairs in the old section and a text
-        // pair between them and the recent entries so the loop stops at the text pair.
-
+    test('preserves entries that fall inside and outside the recent window', () => {
         const history = [
-            ...makePurePair('old1'),   // old — gets removed
-            ...makeTextPair('barrier'), // old text pair — blocks further traversal
+            ...makePurePair('old1'),
+            ...makeTextPair('barrier'),
             ...makeTextPair('r1text'), // recent turn 1
             ...makeTextPair('r2text'), // recent turn 2
         ];
-        // 8 entries total; recentTurns=2 → recentStart = max(0, 8-4) = 4
-        // Loop bound: i < recentStart-1 = 3
-        //   i=0: pure pair 'old1' → splice; array→6; removed=1; i stays 0
-        //   i=0: text pair 'barrier' at [0] → not pure; i += 2 → i=2
-        //   i=2: 2 < 3 → true; history[2] is now r1text assistant, history[3] r1text user
-        //         makeTextPair entries have no toolUses → isPureToolPair = false; i += 2 → i=4
-        //   i=4: 4 < 3 → false → loop exits
-        // So r1text and r2text are fully preserved.
         const payload = makePayload(history);
-        dropOldToolPairs(payload.conversationState.history, payload, 0, 2);
+        const removed = dropOldToolPairs(payload.conversationState.history, payload, 0, 2);
 
         const assistantTexts = payload.conversationState.history
             .map(e => e.assistantResponseMessage?.content)
@@ -169,11 +137,12 @@ describe('dropOldToolPairs', () => {
 
         expect(assistantTexts).toContain('r1text');
         expect(assistantTexts).toContain('r2text');
-        // old1 pure pair should be gone
+        expect(removed).toBe(0);
+        expect(assistantTexts).toContain('barrier');
         const ids = payload.conversationState.history
             .flatMap(e => e.assistantResponseMessage?.toolUses ?? [])
             .map(tu => tu.toolUseId);
-        expect(ids).not.toContain('old1');
+        expect(ids).toContain('old1');
     });
 
     test('does not remove text-only assistant/user pairs', () => {
@@ -207,8 +176,7 @@ describe('dropOldToolPairs', () => {
             0,
             1,
         );
-        // recentTurns=1 protects 2 entries; r1 and r2 are both eligible
-        expect(removed).toBe(2);
+        expect(removed).toBe(0);
     });
 
     test('leaves history untouched when there are no pure pairs', () => {
@@ -241,6 +209,7 @@ describe('summariseOldHistory', () => {
     test('calls callKiro with a prompt string', async () => {
         const history = [
             ...makePurePair('t1'),
+            ...makeTextPair('old text'),
             ...makeTextPair('recent text'),
         ];
         const payload = makePayload(history);
@@ -253,9 +222,26 @@ describe('summariseOldHistory', () => {
         expect(callKiro.mock.calls[0][0].length).toBeGreaterThan(0);
     });
 
-    test('summary prompt preserves tool details for sparse tool-heavy history', async () => {
+    test('preserves old tool-heavy history without summarising it', async () => {
         const history = [
             ...makePurePair('t1'),
+            ...makeTextPair('recent text'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
+
+        await summariseOldHistory(payload, '', callKiro, 1);
+
+        expect(callKiro).not.toHaveBeenCalled();
+        expect(payload.conversationState.history).toHaveLength(4);
+        expect(payload.conversationState.history[0].assistantResponseMessage.toolUses[0].toolUseId).toBe('t1');
+        expect(payload.conversationState.history[1].userInputMessage.userInputMessageContext.toolResults[0].toolUseId).toBe('t1');
+    });
+
+    test('summary prompt omits preserved raw tool details', async () => {
+        const history = [
+            ...makePurePair('t1'),
+            ...makeTextPair('old text that should be summarised'),
             ...makeTextPair('recent text'),
         ];
         const payload = makePayload(history);
@@ -267,9 +253,10 @@ describe('summariseOldHistory', () => {
         expect(prompt).toContain('durable structured working memory');
         expect(prompt).toContain('<coding_memory>');
         expect(prompt).toContain('Pinned facts extracted locally');
-        expect(prompt).toContain('[Tool call] Read#t1');
-        expect(prompt).toContain('/src/t1.js');
-        expect(prompt).toContain('[Tool result] t1');
+        expect(prompt).not.toContain('[Tool call] Read#t1');
+        expect(prompt).not.toContain('/src/t1.js');
+        expect(prompt).not.toContain('[Tool result] t1');
+        expect(payload.conversationState.history[0].assistantResponseMessage.toolUses[0].toolUseId).toBe('t1');
     });
 
     test('retries once when callKiro returns a too-short summary', async () => {
@@ -308,9 +295,11 @@ describe('summariseOldHistory', () => {
     });
 
     test('removes summarised entries from history in-place', async () => {
-        // 2 old turns (4 entries) + 1 recent turn (2 entries)
+        // 1 old tool turn + 1 old text turn + 1 old tool turn + 1 recent turn.
+        // Only the old text turn is summarised; old tool turns stay raw.
         const history = [
             ...makePurePair('t1'),
+            ...makeTextPair('old text'),
             ...makePurePair('t2'),
             ...makeTextPair('recent'),
         ];
@@ -319,13 +308,22 @@ describe('summariseOldHistory', () => {
 
         await summariseOldHistory(payload, '', callKiro, 1);
 
-        // Only the 1 recent turn (2 entries) should remain
-        expect(payload.conversationState.history.length).toBe(2);
+        expect(payload.conversationState.history.length).toBe(6);
+        const ids = payload.conversationState.history
+            .flatMap(e => e.assistantResponseMessage?.toolUses ?? [])
+            .map(tu => tu.toolUseId);
+        expect(ids).toEqual(['t1', 't2']);
+        const assistantTexts = payload.conversationState.history
+            .map(e => e.assistantResponseMessage?.content)
+            .filter(Boolean);
+        expect(assistantTexts).not.toContain('old text');
+        expect(assistantTexts).toContain('recent');
     });
 
     test('falls back to rule-based summary when callKiro throws', async () => {
         const history = [
             ...makePurePair('t1'),
+            ...makeTextPair('old text'),
             ...makeTextPair('recent'),
         ];
         const payload = makePayload(history);
@@ -356,7 +354,7 @@ describe('summariseOldHistory', () => {
         expect(result).not.toContain('No content to summarize.');
     });
 
-    test('summary prompt compacts large tool results before calling Kiro', async () => {
+    test('preserves large tool results raw instead of sending them to Kiro summary', async () => {
         const hugeToolResult = {
             toolUseId: 'big',
             content: [{
@@ -380,12 +378,70 @@ describe('summariseOldHistory', () => {
 
         await summariseOldHistory(payload, '', callKiro, 1);
 
-        const prompt = callKiro.mock.calls[0][0];
-        expect(prompt.length).toBeLessThan(30_000);
-        expect(prompt).toContain('npm test -- tests/app.test.js');
-        expect(prompt).toContain('ERROR expected true received false');
-        expect(prompt).toContain('fatal: build failed');
-        expect(prompt).not.toContain('x'.repeat(10_000));
+        expect(callKiro).not.toHaveBeenCalled();
+        const preservedText = payload.conversationState.history[1]
+            .userInputMessage.userInputMessageContext.toolResults[0].content[0].text;
+        expect(preservedText).toContain('npm test -- tests/app.test.js');
+        expect(preservedText).toContain('ERROR expected true received false');
+        expect(preservedText).toContain('fatal: build failed');
+        expect(preservedText).toContain('x'.repeat(10_000));
+    });
+
+    test('preserves failed build output as raw tool result', async () => {
+        const failureOutput = [
+            'idf.py build',
+            'components/dns_server/dns_server.c:14:10: fatal error: freertos/semphr.h: No such file or directory',
+            'error: unknown type name BaseType_t',
+            'ninja failed with exit code 1',
+        ].join('\n');
+        const history = [
+            makeAssistantEntry('', [{ toolUseId: 'build1', name: 'Bash', input: { command: 'idf.py build' } }]),
+            makeUserEntry('', [makeToolResultWithText('build1', failureOutput, 'error')]),
+            ...makeTextPair('recent'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
+
+        await summariseOldHistory(payload, '', callKiro, 1);
+
+        expect(callKiro).not.toHaveBeenCalled();
+        const preservedText = payload.conversationState.history[1]
+            .userInputMessage.userInputMessageContext.toolResults[0].content[0].text;
+        expect(preservedText).toContain('idf.py build');
+        expect(preservedText).toContain('dns_server.c');
+        expect(preservedText).toContain('BaseType_t');
+        expect(preservedText).toContain('exit code 1');
+    });
+
+    test('preserves failed and later successful build outputs as raw tool results', async () => {
+        const failureOutput = [
+            'idf.py build',
+            'components/dns_server/dns_server.c:14:10: fatal error: freertos/semphr.h: No such file or directory',
+            'ninja failed with exit code 1',
+        ].join('\n');
+        const successOutput = [
+            'idf.py build',
+            'ninja: build stopped: subcommand failed',
+            'Build complete. 0 failed.',
+        ].join('\n').replace('ninja: build stopped: subcommand failed\n', '');
+        const history = [
+            makeAssistantEntry('', [{ toolUseId: 'build1', name: 'Bash', input: { command: 'idf.py build' } }]),
+            makeUserEntry('', [makeToolResultWithText('build1', failureOutput, 'error')]),
+            makeAssistantEntry('', [{ toolUseId: 'build2', name: 'Bash', input: { command: 'idf.py build' } }]),
+            makeUserEntry('', [makeToolResultWithText('build2', successOutput, 'success')]),
+            ...makeTextPair('recent'),
+        ];
+        const payload = makePayload(history);
+        const callKiro = jest.fn().mockResolvedValue(makeValidSummary());
+
+        await summariseOldHistory(payload, '', callKiro, 1);
+
+        expect(callKiro).not.toHaveBeenCalled();
+        const preservedResults = payload.conversationState.history
+            .flatMap(entry => entry.userInputMessage?.userInputMessageContext?.toolResults ?? [])
+            .map(result => result.content[0].text);
+        expect(preservedResults[0]).toContain('exit code 1');
+        expect(preservedResults[1]).toContain('Build complete. 0 failed.');
     });
 
     test('truncates a very long summary to ~6000 chars with ellipsis', async () => {

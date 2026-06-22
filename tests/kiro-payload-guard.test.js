@@ -156,6 +156,26 @@ describe('kiro-payload-guard', () => {
                 }
             }
         });
+
+        test('preserves tool call/results even when payload remains over limit', () => {
+            const history = [
+                userEntry('old text that may be trimmed'),
+                assistantEntry('', [toolUse('tc-preserve')]),
+                userEntryWithToolResults([toolResult('tc-preserve', 'x'.repeat(5000))]),
+            ];
+            const payload = makePayload(history);
+
+            const stats = trimPayloadToLimit(payload, 100);
+
+            expect(stats.finalBytes).toBeGreaterThan(100);
+            const h = payload.conversationState.history;
+            expect(h.some(entry =>
+                entry.assistantResponseMessage?.toolUses?.some(tu => tu.toolUseId === 'tc-preserve')
+            )).toBe(true);
+            expect(h.some(entry =>
+                entry.userInputMessage?.userInputMessageContext?.toolResults?.some(tr => tr.toolUseId === 'tc-preserve')
+            )).toBe(true);
+        });
     });
 
     // ── guardPayload ──────────────────────────────────────────────────────────

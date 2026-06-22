@@ -131,6 +131,7 @@ function createStats() {
         tier3SummarisedEntries: [],
         tier3PromptChars: [],
         tier3PromptPinnedFacts: [],
+        tier3PromptRecentFailures: [],
         tier3PromptToolEvents: [],
         tier3PromptTranscriptExcerpts: [],
         tier3Generated: 0,
@@ -230,12 +231,13 @@ function parseLogText(text, stats) {
             continue;
         }
 
-        match = line.match(/Tier-3 summary prompt compacted: (\d+) history entries -> (\d+) chars \(pinnedFacts=(\d+), toolEvents=(\d+), transcriptExcerpts=(\d+)\)/);
+        match = line.match(/Tier-3 summary prompt compacted: (\d+) history entries -> (\d+) chars \(pinnedFacts=(\d+), (?:(?:recentFailures=(\d+), )?toolEvents=(\d+), transcriptExcerpts=(\d+))\)/);
         if (match) {
             stats.tier3PromptChars.push(Number(match[2]));
             stats.tier3PromptPinnedFacts.push(Number(match[3]));
-            stats.tier3PromptToolEvents.push(Number(match[4]));
-            stats.tier3PromptTranscriptExcerpts.push(Number(match[5]));
+            if (match[4] !== undefined) stats.tier3PromptRecentFailures.push(Number(match[4]));
+            stats.tier3PromptToolEvents.push(Number(match[5]));
+            stats.tier3PromptTranscriptExcerpts.push(Number(match[6]));
             continue;
         }
 
@@ -493,6 +495,7 @@ function buildReport(stats) {
             tier3SummarisedEntries: summarizeArray(stats.tier3SummarisedEntries),
             tier3PromptChars: summarizeArray(stats.tier3PromptChars),
             tier3PromptPinnedFacts: summarizeArray(stats.tier3PromptPinnedFacts),
+            tier3PromptRecentFailures: summarizeArray(stats.tier3PromptRecentFailures),
             tier3PromptToolEvents: summarizeArray(stats.tier3PromptToolEvents),
             tier3PromptTranscriptExcerpts: summarizeArray(stats.tier3PromptTranscriptExcerpts),
             tier3SummaryChars: summarizeArray(stats.tier3SummaryChars),
@@ -664,6 +667,7 @@ function printHuman(report) {
     console.log(`- tier3SummarisedEntries: ${formatSummary(report.contextFidelity.tier3SummarisedEntries)}`);
     console.log(`- tier3PromptChars: ${formatSummary(report.contextFidelity.tier3PromptChars)}`);
     console.log(`- tier3PromptPinnedFacts: ${formatSummary(report.contextFidelity.tier3PromptPinnedFacts)}`);
+    console.log(`- tier3PromptRecentFailures: ${formatSummary(report.contextFidelity.tier3PromptRecentFailures)}`);
     console.log(`- tier3PromptToolEvents: ${formatSummary(report.contextFidelity.tier3PromptToolEvents)}`);
     console.log(`- tier3PromptTranscriptExcerpts: ${formatSummary(report.contextFidelity.tier3PromptTranscriptExcerpts)}`);
     console.log(`- tier3SummaryChars: ${formatSummary(report.contextFidelity.tier3SummaryChars)}`);

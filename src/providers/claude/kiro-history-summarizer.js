@@ -5,11 +5,11 @@
  * the oldest entries, we apply a three-tier strategy:
  *
  *   Tier 1 — RECENT:  keep the last RECENT_TURNS turns intact (never touched)
- *   Tier 2 — MIDDLE:  drop tool_use/tool_result pairs from oldest to newest
- *                     until payload fits, preserving text exchanges
- *   Tier 3 — SUMMARY: if still too large, compress everything outside Tier 1
- *                     into a text summary via a Kiro API call, injected into
- *                     the system prompt so no information is completely lost
+ *   Tier 2 — MIDDLE:  preserve tool_use/tool_result pairs; they are durable
+ *                     coding context and are not a compression target
+ *   Tier 3 — SUMMARY: if still too large, compress old non-tool entries outside
+ *                     Tier 1 via a Kiro API call, injected into the system
+ *                     prompt so no information is completely lost
  *
  * The summary call reuses the same Kiro credentials via the supplied
  * `callKiro(prompt)` callback, keeping dependencies minimal.
@@ -39,6 +39,8 @@ const PINNED_FACTS_MAX = 36;
 const TOOL_DIGEST_MAX = 48;
 const TRANSCRIPT_EXCERPTS_MAX = 64;
 const TOOL_RESULT_PREVIEW_CHARS = 900;
+const RECENT_FAILED_COMMANDS_MAX = 2;
+const RECENT_FAILURE_LINES_MAX = 14;
 
 /** System-prompt section wrapper for injected summaries. */
 const SUMMARY_SECTION_START = '\n\n<conversation_summary>\n';
@@ -96,13 +98,54 @@ function extractCommandCandidates(text) {
     return commands;
 }
 
+function isBuildOrTestCommand(commandText) {
+    return /\b(?:test|build|compile|cmake|ninja|idf\.py|make|pytest|jest|vitest|cargo test|go test|mvn test|gradle test|npm run|pnpm run|yarn test)\b/i.test(commandText || '');
+}
+
+function commandFamilyKey(commandText) {
+    const command = compactWhitespace(commandText).toLowerCase();
+    if (!command) return 'unknown';
+    if (/\bidf\.py\b/.test(command)) return 'idf.py';
+    if (/\bninja\b/.test(command)) return 'ninja';
+    if (/\bcmake\b/.test(command)) return 'cmake';
+    if (/\bnpm\b/.test(command) && /\btest\b/.test(command)) return 'npm test';
+    if (/\bpnpm\b/.test(command) && /\btest\b/.test(command)) return 'pnpm test';
+    if (/\byarn\b/.test(command) && /\btest\b/.test(command)) return 'yarn test';
+    if (/\bpytest\b/.test(command)) return 'pytest';
+    if (/\bjest\b/.test(command)) return 'jest';
+    if (/\bvitest\b/.test(command)) return 'vitest';
+    if (/\bcargo\b/.test(command) && /\btest\b/.test(command)) return 'cargo test';
+    if (/\bgo\b/.test(command) && /\btest\b/.test(command)) return 'go test';
+    if (/\bbuild\b/.test(command)) return 'build';
+    if (/\btest\b/.test(command)) return 'test';
+    return command.slice(0, 80);
+}
+
+function removeBenignFailurePhrases(text) {
+    return String(text || '')
+        .replace(/\b0\s+(?:tests?\s+)?failed\b/ig, '')
+        .replace(/\b0\s+failures?\b/ig, '')
+        .replace(/\bno\s+failures?\b/ig, '');
+}
+
+function resultHasFailureSignal(text, status) {
+    if (status && /^(error|failed|failure)$/i.test(status)) return true;
+    return /\b(error|failed|failure|exception|timeout|timed out|fatal|undefined reference|cannot|denied|not found|exit code [1-9]|returned non-zero|status: [45]\d\d)\b/i.test(removeBenignFailurePhrases(text));
+}
+
+function resultLooksSuccessful(text, status) {
+    if (resultHasFailureSignal(text, status)) return false;
+    if (status && /^success$/i.test(status)) return true;
+    return /\b(success|succeeded|passed|build complete|build succeeded|ninja: no work to do|0 failed|all tests passed)\b/i.test(text || '');
+}
+
 function extractHighSignalLines(text, maxLines = 12) {
     const lines = String(text || '')
         .split(/\r?\n/)
         .map(line => line.trim())
         .filter(Boolean);
     const highSignal = lines.filter(line =>
-        /\b(error|failed|failure|exception|timeout|timed out|fatal|warn|warning|assert|expected|received|cannot|denied|not found|exit code|status: [45]\d\d)\b/i.test(line)
+        /\b(error|failed|failure|exception|timeout|timed out|fatal|warn|warning|assert|expected|received|cannot|denied|not found|exit code|status: [45]\d\d)\b/i.test(removeBenignFailurePhrases(line))
     );
     const selected = highSignal.length > 0 ? highSignal : lines.slice(-maxLines);
     return selected.slice(0, maxLines);
@@ -170,6 +213,30 @@ function summariseToolInput(toolUse) {
     return parts.join(', ');
 }
 
+function toolUseCommand(toolUse) {
+    const input = toolUse?.input || {};
+    return input.command || input.cmd || input.script || extractCommandCandidates(JSON.stringify(input))[0] || '';
+}
+
+function buildFailureMemory({ toolUse, toolResult, resultText }) {
+    const command = toolUseCommand(toolUse) || extractCommandCandidates(resultText)[0] || toolUse?.name || 'unknown command';
+    const highSignal = extractHighSignalLines(resultText, RECENT_FAILURE_LINES_MAX);
+    const paths = [];
+    const seenPaths = new Set();
+    for (const pathCandidate of extractPathCandidates(resultText)) {
+        uniquePush(paths, seenPaths, pathCandidate);
+        if (paths.length >= 8) break;
+    }
+
+    return truncateMiddle([
+        `command=${command}`,
+        `tool=${toolUse?.name || 'unknown'}`,
+        `status=${toolResult?.status || 'unknown'}`,
+        paths.length > 0 ? `paths=${paths.join(', ')}` : '',
+        highSignal.length > 0 ? `errors=${highSignal.join(' / ')}` : `output=${compactWhitespace(resultText).slice(0, 500)}`,
+    ].filter(Boolean).join('; '), 1400);
+}
+
 function classifyUserFact(text) {
     const value = compactWhitespace(text);
     if (!value) return null;
@@ -187,6 +254,8 @@ function buildDeterministicCodingMemory(entries) {
     const pinnedFacts = [];
     const toolDigest = [];
     const transcript = [];
+    const recentFailuresByFamily = new Map();
+    const toolUseById = new Map();
     const seenFacts = new Set();
     const seenTools = new Set();
     const seenTranscript = new Set();
@@ -209,6 +278,7 @@ function buildDeterministicCodingMemory(entries) {
                     const inputSummary = summariseToolInput(tu);
                     const line = `[Tool call] ${tu.name || 'unknown'}${tu.toolUseId ? `#${tu.toolUseId}` : ''}${inputSummary ? `: ${inputSummary}` : ''}`;
                     uniquePush(toolDigest, seenTools, line);
+                    if (tu.toolUseId) toolUseById.set(tu.toolUseId, tu);
 
                     for (const pathCandidate of extractPathCandidates(inputSummary)) {
                         uniquePush(pinnedFacts, seenFacts, `File referenced: ${pathCandidate}`);
@@ -230,6 +300,22 @@ function buildDeterministicCodingMemory(entries) {
             const toolResults = uim.userInputMessageContext?.toolResults;
             if (Array.isArray(toolResults)) {
                 for (const tr of toolResults) {
+                    const resultText = getToolResultText(tr);
+                    const linkedToolUse = toolUseById.get(tr.toolUseId) || null;
+                    const linkedCommand = toolUseCommand(linkedToolUse) || extractCommandCandidates(resultText)[0] || '';
+                    const familyKey = commandFamilyKey(linkedCommand);
+                    const buildOrTestRelated = isBuildOrTestCommand(linkedCommand) || isBuildOrTestCommand(resultText);
+
+                    if (buildOrTestRelated && resultLooksSuccessful(resultText, tr.status)) {
+                        recentFailuresByFamily.delete(familyKey);
+                    } else if (buildOrTestRelated && resultHasFailureSignal(resultText, tr.status)) {
+                        recentFailuresByFamily.set(familyKey, buildFailureMemory({
+                            toolUse: linkedToolUse,
+                            toolResult: tr,
+                            resultText,
+                        }));
+                    }
+
                     const resultSummary = summariseToolResult(tr);
                     uniquePush(toolDigest, seenTools, `[Tool result] ${tr.toolUseId || 'unknown'}: ${resultSummary}`);
 
@@ -246,11 +332,13 @@ function buildDeterministicCodingMemory(entries) {
 
     return {
         pinnedFacts: pinnedFacts.slice(-PINNED_FACTS_MAX),
+        recentFailures: [...recentFailuresByFamily.values()].slice(-RECENT_FAILED_COMMANDS_MAX),
         toolDigest: toolDigest.slice(-TOOL_DIGEST_MAX),
         transcript: transcript.slice(-TRANSCRIPT_EXCERPTS_MAX),
         stats: {
             entries: entries.length,
             pinnedFacts: pinnedFacts.length,
+            recentFailures: recentFailuresByFamily.size,
             toolDigest: toolDigest.length,
             transcript: transcript.length,
         },
@@ -264,34 +352,12 @@ function formatBulletSection(title, lines, emptyText = '- none observed') {
     return `${title}:\n${body}`;
 }
 
-/**
- * Return true if a history entry pair (assistant + following user) is a
- * pure tool exchange with no meaningful text on the assistant side.
- *
- * Kiro history layout:
- *   index i   → { assistantResponseMessage: { content, toolUses } }
- *   index i+1 → { userInputMessage: { userInputMessageContext: { toolResults } } }
- *
- * "Pure tool pair" = assistant has only toolUses (content is empty/whitespace)
- * and the following user message carries only toolResults (no freeform text).
- */
-function isPureToolPair(assistantEntry, userEntry) {
-    if (!assistantEntry || !userEntry) return false;
+function isToolHistoryEntry(entry) {
+    const arm = entry?.assistantResponseMessage;
+    if (Array.isArray(arm?.toolUses) && arm.toolUses.length > 0) return true;
 
-    const arm = assistantEntry.assistantResponseMessage;
-    const uim = userEntry?.userInputMessage;
-    if (!arm || !uim) return false;
-
-    const assistantIsToolOnly =
-        Array.isArray(arm.toolUses) &&
-        arm.toolUses.length > 0 &&
-        (!arm.content || arm.content.trim() === '');
-
-    const userIsToolResultOnly =
-        !!uim.userInputMessageContext?.toolResults?.length &&
-        (!uim.content || uim.content.trim() === '');
-
-    return assistantIsToolOnly && userIsToolResultOnly;
+    const toolResults = entry?.userInputMessage?.userInputMessageContext?.toolResults;
+    return Array.isArray(toolResults) && toolResults.length > 0;
 }
 
 /**
@@ -328,6 +394,7 @@ function buildSummaryPrompt(entries, retryAttempt = 0) {
         '</coding_memory>',
         '',
         `Deterministic extraction stats: entries=${memory.stats.entries}, pinnedFacts=${memory.stats.pinnedFacts}, toolEvents=${memory.stats.toolDigest}, transcriptExcerpts=${memory.stats.transcript}`,
+        formatBulletSection('Recent failed build/test outputs pinned locally', memory.recentFailures),
         formatBulletSection('Pinned facts extracted locally', memory.pinnedFacts),
         formatBulletSection('Tool activity digest', memory.toolDigest),
         formatBulletSection('Compact chronological excerpts', memory.transcript),
@@ -336,7 +403,8 @@ function buildSummaryPrompt(entries, retryAttempt = 0) {
     const prompt = truncateMiddle(lines.join('\n'), SUMMARY_PROMPT_MAX_CHARS);
     logger.info(
         `[Kiro] Tier-3 summary prompt compacted: ${entries.length} history entries -> ${prompt.length} chars ` +
-        `(pinnedFacts=${memory.pinnedFacts.length}, toolEvents=${memory.toolDigest.length}, transcriptExcerpts=${memory.transcript.length})`
+        `(pinnedFacts=${memory.pinnedFacts.length}, recentFailures=${memory.recentFailures.length}, ` +
+        `toolEvents=${memory.toolDigest.length}, transcriptExcerpts=${memory.transcript.length})`
     );
     return prompt;
 }
@@ -358,46 +426,28 @@ function isInvalidSummary(summaryText) {
     return placeholderPatterns.some(pattern => pattern.test(normalized));
 }
 
-// ── Tier 2: drop pure tool pairs ─────────────────────────────────────────────
+// ── Tier 2: preserve pure tool pairs ─────────────────────────────────────────
 
 /**
- * Remove pure tool_use/tool_result pairs from the *oldest* part of history
- * (everything before the protected recent window) until payload fits under
- * maxBytes.  Modifies `history` in-place.
+ * Preserve pure tool_use/tool_result pairs, including old ones.
  *
- * Returns the number of pairs removed.
+ * Kept as an exported compatibility shim for older callers/tests. It no longer
+ * removes tool entries because coding tasks rely on exact tool context more
+ * than they benefit from the smaller payload.
  */
 export function dropOldToolPairs(history, payload, maxBytes, recentTurns = RECENT_TURNS) {
-    // The recent window: last recentTurns*2 entries (each turn = assistant + user)
-    const recentStart = Math.max(0, history.length - recentTurns * 2);
-    let removed = 0;
-
-    // Walk the eligible range from oldest to newest, looking for pairs to drop
-    let i = 0;
-    while (i < recentStart - 1 && payloadBytes(payload) > maxBytes) {
-        // A pair is: assistantResponseMessage at i, userInputMessage at i+1
-        if (isPureToolPair(history[i], history[i + 1])) {
-            history.splice(i, 2);
-            recentStart > 0 && (i = i); // recentStart shifts by 2 automatically since we spliced
-            removed++;
-            // Don't advance i — after splice the next pair is now at the same index
-        } else {
-            i += 2;
-        }
+    if (Array.isArray(history) && payloadBytes(payload) > maxBytes) {
+        logger.info('[Kiro] Tier-2 trim skipped: preserving old tool call/result entries');
     }
-
-    if (removed > 0) {
-        logger.info(`[Kiro] Tier-2 trim: dropped ${removed} pure tool pairs from old history`);
-    }
-    return removed;
+    return 0;
 }
 
 // ── Tier 3: summarise + inject ────────────────────────────────────────────────
 
 /**
- * Summarise history entries that fall outside the recent window by calling
- * Kiro, then inject the summary into systemPrompt and remove those entries
- * from history.
+ * Summarise non-tool history entries that fall outside the recent window by
+ * calling Kiro, then inject the summary into systemPrompt and remove only those
+ * non-tool entries from history. Tool call/result entries are kept raw.
  *
  * @param {object} payload         - Full Kiro request payload (mutated in place)
  * @param {string} systemPrompt    - Current system prompt string
@@ -415,8 +465,22 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
         return systemPrompt;
     }
 
-    const toSummarise = history.slice(0, recentStart);
-    logger.info(`[Kiro] Tier-3 summary: compressing ${toSummarise.length} old history entries via Kiro`);
+    const oldEntries = history.slice(0, recentStart);
+    const preservedOldToolEntries = oldEntries.filter(isToolHistoryEntry);
+    const toSummarise = oldEntries.filter(entry => !isToolHistoryEntry(entry));
+
+    if (toSummarise.length === 0) {
+        logger.info(
+            `[Kiro] Tier-3 summary skipped: preserved ${preservedOldToolEntries.length} old tool entries, ` +
+            'no old non-tool entries to summarise'
+        );
+        return systemPrompt;
+    }
+
+    logger.info(
+        `[Kiro] Tier-3 summary: compressing ${toSummarise.length} old non-tool history entries via Kiro ` +
+        `(preserving ${preservedOldToolEntries.length} old tool entries)`
+    );
 
     let summaryText = '';
     let attempts = 0;
@@ -451,8 +515,8 @@ export async function summariseOldHistory(payload, systemPrompt, callKiro, recen
         `(attempts=${attempts}, durationMs=${Date.now() - startedAt}, fallback=${fallback})`
     );
 
-    // Remove the summarised entries from history
-    history.splice(0, recentStart);
+    // Remove only the summarised non-tool entries; keep old tool call/results raw.
+    history.splice(0, recentStart, ...preservedOldToolEntries);
 
     // Inject summary into system prompt
     const section = `${SUMMARY_SECTION_START}The following is a summary of earlier conversation history that has been compressed to save context space:\n\n${summaryText}${SUMMARY_SECTION_END}`;
@@ -474,7 +538,7 @@ function buildRuleBasedSummary(entries) {
         formatBulletSection('Repository facts', memory.pinnedFacts.filter(line => line.startsWith('Assistant finding') || line.startsWith('Failure signal')).slice(-10)),
         formatBulletSection('Files touched', memory.pinnedFacts.filter(line => line.startsWith('File referenced')).slice(-12)),
         'Decisions:\n- See repository facts and compact excerpts; model summary was unavailable.',
-        formatBulletSection('Failed attempts', memory.pinnedFacts.filter(line => line.startsWith('Failure signal')).slice(-8)),
+        formatBulletSection('Failed attempts', [...memory.recentFailures, ...memory.pinnedFacts.filter(line => line.startsWith('Failure signal'))].slice(-8)),
         formatBulletSection('Commands/tests', memory.pinnedFacts.filter(line => line.startsWith('Command referenced')).slice(-8)),
         formatBulletSection('Open TODO', memory.transcript.slice(-8)),
         '</coding_memory>',
@@ -487,8 +551,8 @@ function buildRuleBasedSummary(entries) {
  * Apply three-tier history compression to the payload if it exceeds maxBytes.
  *
  * Tier 1 is implicit — recentTurns entries at the tail are never touched.
- * Tier 2 drops pure tool pairs from the old section.
- * Tier 3 summarises remaining old entries via a Kiro call.
+ * Tier 2 preserves pure tool pairs from the old section.
+ * Tier 3 summarises remaining old non-tool entries via a Kiro call.
  *
  * @param {object}   payload       - Full Kiro request payload (mutated in place)
  * @param {string}   systemPrompt  - Current system prompt string
@@ -507,7 +571,7 @@ export async function compressHistory(payload, systemPrompt, maxBytes, callKiro,
     const beforeEntries = history.length;
     logger.info(`[Kiro] History compression triggered: ${beforeBytes} bytes > ${maxBytes} bytes (history entries: ${beforeEntries})`);
 
-    // Tier 2 — drop pure tool pairs
+    // Tier 2 — preserve pure tool pairs
     const droppedToolPairs = dropOldToolPairs(history, payload, maxBytes, recentTurns);
     const afterTier2Bytes = payloadBytes(payload);
     logger.info(
