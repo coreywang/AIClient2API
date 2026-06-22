@@ -38,7 +38,7 @@ function makePayload(history) {
     };
 }
 
-// Helper: build a very large history that exceeds 600KB
+// Helper: build a very large history that exceeds the default guard budget.
 function makeLargeHistory(entryCount = 700, contentSize = 1000) {
     const history = [];
     for (let i = 0; i < entryCount; i++) {

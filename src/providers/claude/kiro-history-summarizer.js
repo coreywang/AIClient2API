@@ -23,7 +23,7 @@ import logger from '../../utils/logger.js';
 const RECENT_TURNS = 6;
 
 /** Hard cap on summary text length to avoid re-inflating the payload. */
-const SUMMARY_MAX_CHARS = 4000;
+const SUMMARY_MAX_CHARS = 16000;
 
 /** Summaries shorter than this usually indicate a placeholder or empty reply. */
 const SUMMARY_MIN_CHARS = 160;

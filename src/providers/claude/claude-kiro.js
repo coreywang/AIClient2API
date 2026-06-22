@@ -60,7 +60,7 @@ const KIRO_CONSTANTS = {
 
 const KIRO_CONTEXT_LIMITS = {
     // Feature 1: Payload guard
-    MAX_PAYLOAD_BYTES: 1000000,         // Raised to 1MB; monitor for 413 errors and reduce if needed
+    MAX_PAYLOAD_BYTES: 580000,          // Trigger summary just below guardPayload's local 600KB safety budget
     AUTO_TRIM_PAYLOAD: true,
 
     // Feature 2: Content-length error retry

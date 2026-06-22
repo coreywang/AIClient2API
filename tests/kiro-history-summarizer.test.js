@@ -353,23 +353,23 @@ describe('summariseOldHistory', () => {
         expect(result).not.toContain('No content to summarize.');
     });
 
-    test('truncates a very long summary to ~4000 chars with ellipsis', async () => {
+    test('truncates a very long summary to ~16000 chars with ellipsis', async () => {
         const history = [
             ...makeTextPair('old'),
             ...makeTextPair('recent'),
         ];
         const payload = makePayload(history);
-        const longSummary = 'x'.repeat(10_000);
+        const longSummary = 'x'.repeat(20_000);
         const callKiro = jest.fn().mockResolvedValue(longSummary);
 
         const result = await summariseOldHistory(payload, '', callKiro, 1);
 
-        // The injected summary portion must be capped (4000 chars + one '…' character)
+        // The injected summary portion must be capped (16000 chars + one '…' character)
         const start = result.indexOf('<conversation_summary>');
         const end = result.indexOf('</conversation_summary>');
         const injectedSection = result.slice(start, end);
-        // 4001 summary chars + surrounding wrapper text — well under 5500
-        expect(injectedSection.length).toBeLessThan(5500);
+        // 16001 summary chars + surrounding wrapper text — well under 17500
+        expect(injectedSection.length).toBeLessThan(17500);
         expect(result).toContain('…');
     });
 

@@ -1,17 +1,17 @@
 /**
  * Payload size guard for Kiro API requests.
  *
- * The Kiro API rejects payloads exceeding ~615KB with a misleading
- * "Improperly formed request." (reason: null) error. This module provides:
+ * Oversized Kiro payloads can fail with misleading upstream errors. The exact
+ * upstream boundary is not treated as a fixed contract here; this module provides:
  * - Pre-flight size checking
- * - Auto-trimming of oldest history entries to fit under the limit
+ * - Auto-trimming of oldest history entries to fit under a local safety budget
  * - Orphaned toolResult repair after trimming
  *
  * Ported from KiroProxy/kiro_proxy/payload_guards.py
  */
 import logger from '../../utils/logger.js';
 
-const MAX_PAYLOAD_BYTES = 600000; // 600KB, below Kiro's ~615KB hard limit
+const MAX_PAYLOAD_BYTES = 600000; // Local safety budget; tune from production evidence.
 const AUTO_TRIM_PAYLOAD = true;   // auto-trim by default
 
 /**
